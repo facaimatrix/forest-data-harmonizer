@@ -154,7 +154,7 @@ window.I18N_LOCALES.es = {
   'step4.treeIdDesc': 'Identificador persistente del fuste entre años de censo. Debe ser único dentro de una parcela.',
   'step4.treeIdTip': '💡 Si su tabla tiene TreeID (árbol individual) y StemID (fuste en árbol multitrónco), seleccione ambos — la app los concatena como treeid_stemid.',
   'step4.dbh': 'DBH',
-  'step4.dbhDesc': 'Diámetro a la altura del pecho. Unidad establecida en {unit} en el paso 3.',
+  'step4.dbhDesc': 'Diámetro a la altura del pecho. Unidad establecida en {unit} en el paso Contacto y conjunto de datos.',
   'step4.yr': 'YR',
   'step4.yrDesc': 'Año de censo (4 dígitos). Se usa para calcular el desfase PrevYR por árbol.',
   'step4.species': 'Especie',

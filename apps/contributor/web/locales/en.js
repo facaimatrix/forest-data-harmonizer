@@ -166,7 +166,7 @@ window.I18N_LOCALES.en = {
   'step4.treeIdDesc': 'Persistent stem identifier across census years. Must be unique within a plot.',
   'step4.treeIdTip': '💡 If your table has both a TreeID (individual tree) and a StemID (stem on a multi-stemmed tree), select both — the app concatenates them as treeid_stemid.',
   'step4.dbh': 'DBH',
-  'step4.dbhDesc': 'Diameter at breast height. Unit set to {unit} in step 3.',
+  'step4.dbhDesc': 'Diameter at breast height. Unit set to {unit} on the Contact & dataset step.',
   'step4.yr': 'YR',
   'step4.yrDesc': 'Census year (4-digit). Used to compute PrevYR lag per tree.',
   'step4.species': 'Species',

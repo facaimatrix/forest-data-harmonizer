@@ -26,8 +26,28 @@ const openDialog = async (opts = {}) => {
 const t = (key, params) => I18n.t(key, params);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const HARMONIZE_STEP_KEYS = ['steps.load', 'steps.mode', 'steps.format', 'steps.contact', 'steps.inventory', 'steps.status', 'steps.validate', 'steps.export'];
-const DIAGNOSE_STEP_KEYS  = ['steps.load', 'steps.mode', 'steps.diagnose'];
+const HARMONIZE_STEP_KEYS = ['steps.contact', 'steps.mode', 'steps.load', 'steps.format', 'steps.inventory', 'steps.status', 'steps.validate', 'steps.export'];
+const DIAGNOSE_STEP_KEYS  = ['steps.contact', 'steps.mode', 'steps.load', 'steps.diagnose'];
+
+// Harmonize pipeline: Contact → Mode → Load → Format → …
+const STEP = {
+  CONTACT: 0,
+  MODE: 1,
+  LOAD: 2,
+  FORMAT: 3,
+  INVENTORY: 4,
+  STATUS: 5,
+  VALIDATE: 6,
+  EXPORT: 7,
+};
+
+function harmonizeRender() {
+  return [renderStep3, renderStep1, renderStep0, renderStep2, renderStep4, renderStep5, renderStep6, renderStep7][state.step] || renderStep3;
+}
+
+function diagnoseRender() {
+  return [renderStep3, renderStep1, renderStep0, renderDiagnoseStep2][state.step] || renderStep3;
+}
 
 // ISO 3166-1 country list (name → iso3) — ordered alphabetically by name
 const COUNTRIES = [
@@ -993,24 +1013,35 @@ function renderNav() {
   let hint = '', nextLabel = t('nav.next'), nextDisabled = false;
 
   const lr = state.loadResult;
-  if (state.step === 0) {
-    if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
-    else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
-  }
-  if (state.step === 1 && !state.mode) { hint = t('nav.hint.chooseMode'); nextDisabled = true; }
-
-  if (state.mode === 'harmonize') {
-    if (state.step === 2 && !state.dataFormat) { hint = t('nav.hint.selectFormat'); nextDisabled = true; }
-
-    if (state.step === 3) {
+  if (state.mode === 'diagnose') {
+    if (state.step === STEP.CONTACT) {
       const dsn = computeDsn();
       if (!state.contact.firstName.trim() || !state.contact.lastName.trim()) { hint = t('nav.hint.nameRequired'); nextDisabled = true; }
       else if (!state.countryName) { hint = t('nav.hint.selectCountry'); nextDisabled = true; }
       else if (!String(state.submitYear).match(/^\d{4}$/)) { hint = t('nav.hint.submitYear'); nextDisabled = true; }
       else if (!dsn) { hint = t('nav.hint.completeDsn'); nextDisabled = true; }
     }
+    if (state.step === STEP.MODE && !state.mode) { hint = t('nav.hint.chooseMode'); nextDisabled = true; }
+    if (state.step === STEP.LOAD) {
+      if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
+      else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
+    }
+  } else {
+    if (state.step === STEP.CONTACT) {
+      const dsn = computeDsn();
+      if (!state.contact.firstName.trim() || !state.contact.lastName.trim()) { hint = t('nav.hint.nameRequired'); nextDisabled = true; }
+      else if (!state.countryName) { hint = t('nav.hint.selectCountry'); nextDisabled = true; }
+      else if (!String(state.submitYear).match(/^\d{4}$/)) { hint = t('nav.hint.submitYear'); nextDisabled = true; }
+      else if (!dsn) { hint = t('nav.hint.completeDsn'); nextDisabled = true; }
+    }
+    if (state.step === STEP.MODE && !state.mode) { hint = t('nav.hint.chooseMode'); nextDisabled = true; }
+    if (state.step === STEP.LOAD) {
+      if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
+      else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
+    }
+    if (state.step === STEP.FORMAT && !state.dataFormat) { hint = t('nav.hint.selectFormat'); nextDisabled = true; }
 
-    if (state.step === 4) {
+    if (state.step === STEP.INVENTORY) {
       const { ok, reason } = inventoryValid();
       if (!ok) { hint = reason; nextDisabled = true; }
       else if (state.dataFormat === 'wide' && state.wideStep === 0) { nextLabel = t('nav.nextYears'); }
@@ -1018,20 +1049,18 @@ function renderNav() {
       else { nextLabel = t('nav.applyMapping'); }
     }
 
-    if (state.step === 5) {
+    if (state.step === STEP.STATUS) {
       if (state.statusMode === 'derive' && !state.deriveResult) { hint = t('nav.hint.runDerive'); nextDisabled = true; }
       else if (state.statusMode === 'column' && !statusColSelected()) { hint = t('nav.hint.selectStatusCol'); nextDisabled = true; }
       else { nextLabel = t('nav.validate'); }
     }
 
-    if (state.step === 6) {
+    if (state.step === STEP.VALIDATE) {
       nextLabel = t('nav.continueExport');
       const hasBlockers = state.validationReport?.findings?.some(f=>f.severity==='RequiresInput'||f.severity==='Escalate');
       if (hasBlockers) hint = t('nav.hint.resolveBeforeExport');
     }
   }
-
-  if (state.mode === 'diagnose' && state.step === 2) { nextDisabled = true; nextLabel = t('nav.done'); }
 
   const isLastStep = state.step === stepNames().length - 1;
   if (isLastStep) { nextLabel = t('nav.startOver'); nextDisabled = false; }
@@ -1074,9 +1103,9 @@ function render() {
   try {
     let html = '';
     if (state.mode === 'diagnose') {
-      html = ([renderStep0, renderStep1, renderDiagnoseStep2][state.step] || renderStep0)();
+      html = (diagnoseRender() || renderStep1)();
     } else {
-      html = ([renderStep0, renderStep1, renderStep2, renderStep3, renderStep4, renderStep5, renderStep6, renderStep7][state.step] || renderStep0)();
+      html = (harmonizeRender() || renderStep3)();
     }
     document.getElementById('main').innerHTML = html;
   } catch(e) {
@@ -1306,7 +1335,7 @@ function refreshNav() {
 
 function attachNavHandlers() {
   el('btn-prev', btn => btn.addEventListener('click', () => {
-    if (state.step === 4 && state.dataFormat === 'wide' && state.wideStep === 1) {
+    if (state.step === STEP.INVENTORY && state.dataFormat === 'wide' && state.wideStep === 1) {
       state.wideStep = 0; clearError(); render(); return;
     }
     if (state.step > 0) { state.step--; clearError(); render(); }
@@ -1321,29 +1350,34 @@ function attachNavHandlers() {
 
 // ── Step advance ───────────────────────────────────────────────────────────────
 async function advanceStep() {
-  // Collect DOM state for step 3
-  if (state.step === 3) collectStep3Dom();
+  if (state.step === STEP.CONTACT) collectStep3Dom();
 
-  // Diagnose: step 1 → validate directly
-  if (state.mode === 'diagnose' && state.step === 1) {
+  // Diagnose: after Load → validate → results
+  if (state.mode === 'diagnose' && state.step === STEP.LOAD) {
     showLoading(t('loading.integrity'));
     try {
       await invoke('use_raw_as_gfb3');
       state.validationReport = await invoke('run_validation');
-      state.step = 2; render();
+      state.step = DIAGNOSE_STEP_KEYS.length - 1; render();
     } finally { hideLoading(); }
     return;
   }
 
-  // Harmonize step 4 wide sub-step 0 → 1
-  if (state.mode === 'harmonize' && state.step === 4 && state.dataFormat === 'wide' && state.wideStep === 0) {
+  // Harmonize only from here
+  if (state.mode === 'diagnose') {
+    if (state.step < stepNames().length - 1) { state.step++; render(); }
+    return;
+  }
+
+  // Harmonize inventory wide sub-step 0 → 1
+  if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'wide' && state.wideStep === 0) {
     state.wideStep = 1;
     render();
     return;
   }
 
-  // Harmonize step 4 (long): apply field mapping
-  if (state.mode === 'harmonize' && state.step === 4 && state.dataFormat === 'long') {
+  // Harmonize inventory (long): apply field mapping
+  if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'long') {
     showLoading(t('loading.mapping'));
     try {
       const fields = buildFieldExprs();
@@ -1365,7 +1399,7 @@ async function advanceStep() {
       });
       state.deriveResult = null;
       // For single-census data, skip the Status step (no PrevYR/PrevDBH needed)
-      state.step = state.censusType === 'single' ? 6 : 5;
+      state.step = state.censusType === 'single' ? STEP.VALIDATE : STEP.STATUS;
       if (state.censusType === 'single') {
         showLoading(t('loading.validate'));
         try { state.validationReport = await invoke('run_validation'); } finally { hideLoading(); }
@@ -1375,8 +1409,8 @@ async function advanceStep() {
     return;
   }
 
-  // Harmonize step 4 (wide): pivot
-  if (state.mode === 'harmonize' && state.step === 4 && state.dataFormat === 'wide') {
+  // Harmonize inventory (wide): pivot
+  if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'wide') {
     showLoading(t('loading.pivot'));
     try {
       const wideIdentityExprs = buildFieldExprs().filter(f =>
@@ -1399,13 +1433,13 @@ async function advanceStep() {
         },
       });
       state.deriveResult = null;
-      state.step = 5; render();
+      state.step = STEP.STATUS; render();
     } finally { hideLoading(); }
     return;
   }
 
-  // Harmonize step 5 (status) → validate
-  if (state.mode === 'harmonize' && state.step === 5) {
+  // Harmonize status → validate
+  if (state.mode === 'harmonize' && state.step === STEP.STATUS) {
     if (state.statusMode === 'column') {
       // Re-apply with the status column included
       showLoading(t('loading.statusCol'));
@@ -1424,7 +1458,7 @@ async function advanceStep() {
     showLoading(t('loading.validate'));
     try {
       state.validationReport = await invoke('run_validation');
-      state.step = 6; render();
+      state.step = STEP.VALIDATE; render();
     } finally { hideLoading(); }
     return;
   }
