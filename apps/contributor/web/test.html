@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>GFB3 Harmonizer Test</title>
+  <style>
+    body { font-family: Arial; margin: 0; padding: 20px; background: #f0f0f0; }
+    .box { background: white; padding: 20px; margin: 10px 0; border: 1px solid #ccc; }
+    button { padding: 10px 20px; background: #2d6a4f; color: white; border: none; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>GFB3 Harmonizer - Test Page</h1>
+  <div class="box">
+    <h2>If you see this, the basic rendering works!</h2>
+    <p>This is a pure HTML test with no JavaScript.</p>
+    <button onclick="alert('Button works!')">Click Me</button>
+  </div>
+  <div class="box">
+    <h3>Checking Tauri API...</h3>
+    <p id="tauri-status">Checking...</p>
+    <script>
+      document.getElementById('tauri-status').textContent = 
+        window.__TAURI__ ? '✓ Tauri API is available' : '✗ Tauri API NOT available';
+    </script>
+  </div>
+</body>
+</html>

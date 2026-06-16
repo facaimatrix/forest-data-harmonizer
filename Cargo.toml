@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "crates/gfb3-core",
+    "apps/contributor/src-tauri",
+]
+resolver = "2"
+
+[workspace.dependencies]
+polars = { version = "0.46", features = [
+    "lazy",
+    "parquet",
+    "csv",
+    "strings",
+    "temporal",
+    "dtype-categorical",
+    "dtype-date",
+    "fmt",
+    "is_in",
+    "concat_str",
+] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+chrono      = { version = "0.4", features = ["serde"] }
+calamine        = "0.26"
+rust_xlsxwriter = "0"
