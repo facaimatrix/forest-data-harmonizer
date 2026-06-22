@@ -1,9 +1,9 @@
 window.I18N_LOCALES = window.I18N_LOCALES || {};
 window.I18N_LOCALES.en = {
-  'meta.title': 'GFB3 Harmonizer — Contributor',
+  'meta.title': 'Forest Data Harmonizer — Contributor',
   'meta.loadingApp': 'Loading application…',
 
-  'header.title': 'GFB3 Harmonizer',
+  'header.title': 'Forest Data Harmonizer',
   'header.subtitle': 'Contributor draft tool',
   'header.language': 'Language',
 

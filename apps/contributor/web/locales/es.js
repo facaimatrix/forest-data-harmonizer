@@ -1,8 +1,8 @@
 window.I18N_LOCALES = window.I18N_LOCALES || {};
 window.I18N_LOCALES.es = {
-  'meta.title': 'GFB3 Harmonizer — Colaborador',
+  'meta.title': 'Forest Data Harmonizer — Colaborador',
   'meta.loadingApp': 'Cargando aplicación…',
-  'header.title': 'GFB3 Harmonizer',
+  'header.title': 'Forest Data Harmonizer',
   'header.subtitle': 'Herramienta de borrador para colaboradores',
   'header.language': 'Idioma',
   'common.working': 'Trabajando…',

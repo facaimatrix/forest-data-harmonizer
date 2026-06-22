@@ -1597,7 +1597,7 @@ function confirmMapCoords() {
 }
 
 // ── Init ───────────────────────────────────────────────────────────────────────
-console.log('=== GFB3 Harmonizer initializing ===');
+console.log('=== Forest Data Harmonizer initializing ===');
 I18n.init({ onChange: () => render() });
 window.onerror = (msg, src, line) => { showError(t('error.js', { msg, src, line })); return false; };
 window.addEventListener('unhandledrejection', ev => showError(t('error.generic', { reason: ev.reason })));

@@ -5,7 +5,7 @@
   const m = (code, o) => { L[code] = Object.assign({}, en, o); };
 
   m('fr', {
-    'meta.title': 'GFB3 Harmonizer — Contributeur',
+    'meta.title': 'Forest Data Harmonizer — Contributeur',
     'meta.loadingApp': 'Chargement de l\'application…',
     'header.subtitle': 'Outil brouillon pour contributeurs',
     'header.language': 'Langue',
@@ -128,7 +128,7 @@
   });
 
   m('de', {
-    'meta.title': 'GFB3 Harmonizer — Mitwirkende',
+    'meta.title': 'Forest Data Harmonizer — Mitwirkende',
     'meta.loadingApp': 'Anwendung wird geladen…',
     'header.subtitle': 'Entwurfswerkzeug für Mitwirkende',
     'header.language': 'Sprache',
@@ -216,7 +216,7 @@
   });
 
   m('it', {
-    'meta.title': 'GFB3 Harmonizer — Collaboratore',
+    'meta.title': 'Forest Data Harmonizer — Collaboratore',
     'header.subtitle': 'Strumento bozza per collaboratori',
     'header.language': 'Lingua',
     'common.working': 'Elaborazione…',
@@ -243,7 +243,7 @@
   });
 
   m('nl', {
-    'meta.title': 'GFB3 Harmonizer — Bijdrager',
+    'meta.title': 'Forest Data Harmonizer — Bijdrager',
     'header.subtitle': 'Concepttool voor bijdragers',
     'header.language': 'Taal',
     'common.working': 'Bezig…',
@@ -264,7 +264,7 @@
   });
 
   m('ru', {
-    'meta.title': 'GFB3 Harmonizer — Участник',
+    'meta.title': 'Forest Data Harmonizer — Участник',
     'header.subtitle': 'Черновой инструмент для участников',
     'header.language': 'Язык',
     'common.working': 'Обработка…',
@@ -292,7 +292,7 @@
   });
 
   m('ja', {
-    'meta.title': 'GFB3 Harmonizer — 投稿者',
+    'meta.title': 'Forest Data Harmonizer — 投稿者',
     'header.subtitle': '投稿者向けドラフトツール',
     'header.language': '言語',
     'common.working': '処理中…',
@@ -339,7 +339,7 @@
   });
 
   m('zh', {
-    'meta.title': 'GFB3 Harmonizer — 贡献者',
+    'meta.title': 'Forest Data Harmonizer — 贡献者',
     'header.subtitle': '贡献者草稿工具',
     'header.language': '语言',
     'common.working': '处理中…',
@@ -386,7 +386,7 @@
   });
 
   m('ko', {
-    'meta.title': 'GFB3 Harmonizer — 기여자',
+    'meta.title': 'Forest Data Harmonizer — 기여자',
     'header.subtitle': '기여자 초안 도구',
     'header.language': '언어',
     'common.working': '작업 중…',
@@ -412,7 +412,7 @@
   });
 
   m('hi', {
-    'meta.title': 'GFB3 Harmonizer — योगदानकर्ता',
+    'meta.title': 'Forest Data Harmonizer — योगदानकर्ता',
     'header.subtitle': 'योगदानकर्ता ड्राफ्ट उपकरण',
     'header.language': 'भाषा',
     'common.working': 'कार्य जारी…',
@@ -431,7 +431,7 @@
   });
 
   m('id', {
-    'meta.title': 'GFB3 Harmonizer — Kontributor',
+    'meta.title': 'Forest Data Harmonizer — Kontributor',
     'header.subtitle': 'Alat draf kontributor',
     'header.language': 'Bahasa',
     'common.working': 'Memproses…',
@@ -450,7 +450,7 @@
   });
 
   m('th', {
-    'meta.title': 'GFB3 Harmonizer — ผู้มีส่วนร่วม',
+    'meta.title': 'Forest Data Harmonizer — ผู้มีส่วนร่วม',
     'header.subtitle': 'เครื่องมือร่างสำหรับผู้มีส่วนร่วม',
     'header.language': 'ภาษา',
     'common.working': 'กำลังทำงาน…',
@@ -469,7 +469,7 @@
   });
 
   m('ar', {
-    'meta.title': 'GFB3 Harmonizer — المساهم',
+    'meta.title': 'Forest Data Harmonizer — المساهم',
     'header.subtitle': 'أداة مسودة للمساهمين',
     'header.language': 'اللغة',
     'common.working': 'جارٍ العمل…',

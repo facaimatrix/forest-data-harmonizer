@@ -1,6 +1,6 @@
 window.I18N_LOCALES = window.I18N_LOCALES || {};
 window.I18N_LOCALES.pt = Object.assign({}, window.I18N_LOCALES.en, {
-  'meta.title': 'GFB3 Harmonizer — Colaborador',
+  'meta.title': 'Forest Data Harmonizer — Colaborador',
   'meta.loadingApp': 'Carregando aplicativo…',
   'header.subtitle': 'Ferramenta de rascunho para colaboradores',
   'header.language': 'Idioma',
