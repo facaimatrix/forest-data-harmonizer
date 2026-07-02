@@ -7,6 +7,6 @@ pub mod transform;
 pub mod validation;
 
 pub use schema::{FieldDef, Gfb3Field, InputGate, GateError, gfb3_field_defs};
-pub use validation::{validate, ValidationReport, ValidationFinding, ValidationRule, Severity, RecommendedAction};
-pub use mapping::{ContributorMapping, ColumnMapping, StatusRemap};
+pub use validation::{validate, ValidateOptions, ValidationReport, ValidationFinding, ValidationRule, Severity, RecommendedAction};
+pub use mapping::{ContributorMapping, ColumnMapping, StatusRemap, CensusType};
 pub use transform::{DeriveStatusSummary, FieldExpr};

@@ -1450,7 +1450,7 @@ async function advanceStep() {
             fields:   buildFieldExprs(),
             dbh_unit: state.dbhUnit,
             status_remaps: [],
-            metadata: { country: state.country||null, site: state.siteName||null, pi: state.piName||null, dbh_unit: state.dbhUnit, census_years: state.censusYears },
+            metadata: { country: state.country||null, site: state.siteName||null, pi: state.piName||null, dbh_unit: state.dbhUnit, census_years: state.censusYears, census_type: state.censusType },
           },
         });
       } finally { hideLoading(); }

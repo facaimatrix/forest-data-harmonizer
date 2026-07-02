@@ -42,6 +42,14 @@ pub struct ContributorMapping {
     pub metadata: DatasetMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CensusType {
+    #[default]
+    Multi,
+    Single,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatasetMetadata {
     pub country: Option<String>,
@@ -50,6 +58,8 @@ pub struct DatasetMetadata {
     pub dbh_unit: Option<DbhUnit>,
     pub coordinate_crs: Option<String>,
     pub census_years: Vec<u32>,
+    #[serde(default)]
+    pub census_type: CensusType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

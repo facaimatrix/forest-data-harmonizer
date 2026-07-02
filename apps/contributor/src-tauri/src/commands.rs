@@ -5,17 +5,17 @@ use tauri::command;
 use gfb3_core::export::{coerce_status_to_int, draft_filename, write_csv, write_parquet, write_xlsx, Provenance};
 use gfb3_core::log::CurationLog;
 use gfb3_core::mapping::{
-    ColumnMapping, ContributorMapping, DatasetMetadata, DbhUnit, StatusRemap,
+    CensusType, ColumnMapping, ContributorMapping, DatasetMetadata, DbhUnit, StatusRemap,
 };
 use gfb3_core::reader::{dataframe_preview, read_file};
 use gfb3_core::schema::{gfb3_field_defs, Gfb3Field, InputGate};
 use gfb3_core::transform::{
-    apply_column_mapping, apply_field_exprs, apply_status_remap, compute_prev_yr, dedup,
-    derive_status_column, melt_wide_to_long, scale_dbh_mm_to_cm, DeriveStatusSummary, FieldExpr,
+    apply_column_mapping, apply_field_exprs, apply_status_remap, derive_status_column,
+    melt_wide_to_long, prepare_mapped_frame, scale_dbh_mm_to_cm, DeriveStatusSummary, FieldExpr,
 };
 use gfb3_core::validation::{
     drop_anchor_rows, drop_invalid_rows, nullify_dead_dbh, recode_unknown_status, sort_for_lag,
-    validate, ValidationReport,
+    validate, ValidateOptions, ValidationReport,
 };
 use polars::prelude::{AnyValue, DataFrame, DataType, IntoLazy, JoinArgs, JoinType, col as pcol};
 
@@ -126,6 +126,8 @@ pub struct MetadataInput {
     /// "cm" or "mm"
     pub dbh_unit: Option<String>,
     pub census_years: Vec<u32>,
+    /// "single" or "multi" (defaults to multi)
+    pub census_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +183,7 @@ pub async fn apply_mapping(
         }
     };
 
+    let census_type = parse_census_type(&request.metadata);
     let metadata = DatasetMetadata {
         country: request.metadata.country,
         site: request.metadata.site,
@@ -188,6 +191,7 @@ pub async fn apply_mapping(
         dbh_unit,
         coordinate_crs: None,
         census_years: request.metadata.census_years,
+        census_type,
     };
 
     let mapping = ContributorMapping {
@@ -323,7 +327,17 @@ pub async fn run_validation(
         .as_ref()
         .ok_or("column mapping not applied — call apply_mapping first")?;
 
-    let report = validate(df.clone().lazy()).map_err(|e| e.to_string())?;
+    let census_type = session
+        .mapping
+        .as_ref()
+        .map(|m| m.metadata.census_type)
+        .unwrap_or(CensusType::Multi);
+
+    let report = validate(
+        df.clone().lazy(),
+        ValidateOptions { census_type },
+    )
+    .map_err(|e| e.to_string())?;
     session.validation_report = Some(report.clone());
     Ok(report)
 }
@@ -358,13 +372,23 @@ pub async fn export(
         .map(|m| m.gfb3_dsn.as_str())
         .unwrap_or("dataset");
 
+    let census_type = session
+        .mapping
+        .as_ref()
+        .map(|m| m.metadata.census_type)
+        .unwrap_or(CensusType::Multi);
+
     // Full export pipeline: recode → nullify → drop invalids → drop anchors
     //                        → sort for lag → coerce status to Int32
     let lf = mapped_df.clone().lazy();
     let lf = recode_unknown_status(lf);
     let lf = nullify_dead_dbh(lf);
-    let lf = drop_invalid_rows(lf);
-    let lf = drop_anchor_rows(lf);
+    let lf = drop_invalid_rows(lf, census_type);
+    let lf = if census_type == CensusType::Single {
+        lf
+    } else {
+        drop_anchor_rows(lf)
+    };
     let lf = sort_for_lag(lf);
     let lf = coerce_status_to_int(lf);
     let export_df = lf.collect().map_err(|e| e.to_string())?;
@@ -491,13 +515,12 @@ pub async fn apply_wide_mapping(
         Some(other) => return Err(format!("unknown DBH unit '{other}'; expected 'cm' or 'mm'")),
     };
 
+    let census_type = parse_census_type(&request.metadata);
+
     let lf = long_df.lazy();
     let lf = apply_status_remap(lf, &remap_pairs);
     let lf = if matches!(dbh_unit, Some(DbhUnit::Mm)) { scale_dbh_mm_to_cm(lf) } else { lf };
-    // Sort → dedup → compute PrevYR (CLAUDE.md invariant order).
-    let lf = sort_for_lag(lf);
-    let lf = dedup(lf);
-    let lf = compute_prev_yr(lf);
+    let lf = prepare_mapped_frame(lf, census_type);
 
     let mapped_df = lf.collect().map_err(|e| e.to_string())?;
     let mapped_columns: Vec<String> =
@@ -511,6 +534,7 @@ pub async fn apply_wide_mapping(
         dbh_unit,
         coordinate_crs: None,
         census_years: request.metadata.census_years,
+        census_type,
     };
     let mapping = ContributorMapping {
         gfb3_dsn: request.gfb3_dsn.clone(),
@@ -610,6 +634,9 @@ pub async fn apply_fields_mapping(
     };
     let (lf, dbh_unit_enum) = dbh_unit;
 
+    let census_type = parse_census_type(&request.metadata);
+    let lf = prepare_mapped_frame(lf, census_type);
+
     let mapped_df = lf.collect().map_err(|e| e.to_string())?;
     let mapped_columns: Vec<String> = mapped_df.get_column_names().iter().map(|s| s.to_string()).collect();
     let row_count = mapped_df.height();
@@ -621,6 +648,7 @@ pub async fn apply_fields_mapping(
         dbh_unit:       dbh_unit_enum,
         coordinate_crs: None,
         census_years:   request.metadata.census_years,
+        census_type,
     };
     let mapping = ContributorMapping {
         gfb3_dsn:        request.gfb3_dsn,
@@ -674,10 +702,19 @@ pub async fn derive_status(
     let (derived_df, summary) = derive_status_column(df.clone().lazy(), treatment)
         .map_err(|e| e.to_string())?;
 
-    let row_count = derived_df.height();
-    let mapped_columns = derived_df.get_column_names().iter().map(|s| s.to_string()).collect();
+    let census_type = session
+        .mapping
+        .as_ref()
+        .map(|m| m.metadata.census_type)
+        .unwrap_or(CensusType::Multi);
+    let final_df = prepare_mapped_frame(derived_df.lazy(), census_type)
+        .collect()
+        .map_err(|e| e.to_string())?;
 
-    session.mapped_df = Some(derived_df);
+    let row_count = final_df.height();
+    let mapped_columns = final_df.get_column_names().iter().map(|s| s.to_string()).collect();
+
+    session.mapped_df = Some(final_df);
     Ok(DeriveStatusResult { summary, row_count, mapped_columns })
 }
 
@@ -704,6 +741,13 @@ pub async fn use_raw_as_gfb3(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn parse_census_type(metadata: &MetadataInput) -> CensusType {
+    match metadata.census_type.as_deref() {
+        Some("single") | Some("s") => CensusType::Single,
+        _ => CensusType::Multi,
+    }
+}
 
 /// Left-join lookup files onto `lf` for any `kind == "lookup"` entries.
 /// Each lookup entry loads a separate file and joins on `main_key` = `lookup_key`,

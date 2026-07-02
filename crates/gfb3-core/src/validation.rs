@@ -2,6 +2,7 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::mapping::CensusType;
 use crate::schema::{STATUS_ALIVE, STATUS_DEAD, STATUS_MISSING, STATUS_RECRUIT};
 
 // ---------------------------------------------------------------------------
@@ -93,11 +94,17 @@ pub enum ValidationError {
 // Main entry point
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ValidateOptions {
+    pub census_type: CensusType,
+}
+
 /// Run all GFB3 validation checks against a mapped, pre-pivot LazyFrame.
 ///
 /// The LazyFrame must already have canonical GFB3 column names (PlotID, TreeID,
-/// YR, PrevYR, Status, DBH, gfb3_dsn).  Status must be a String column.
-pub fn validate(lf: LazyFrame) -> Result<ValidationReport, ValidationError> {
+/// YR, Status, DBH, gfb3_dsn). Multi-census data must also have PrevYR.
+/// Status must be a String column.
+pub fn validate(lf: LazyFrame, options: ValidateOptions) -> Result<ValidationReport, ValidationError> {
     let mut findings = Vec::new();
 
     // Collect once for checks that need a materialized frame.
@@ -107,8 +114,10 @@ pub fn validate(lf: LazyFrame) -> Result<ValidationReport, ValidationError> {
     findings.extend(check_unknown_status(&df)?);
     findings.extend(check_dead_tree_dbh(&df)?);
     findings.extend(check_recruit_missing_dbh(&df)?);
-    findings.extend(check_orphan_dead_first_census(&df)?);
-    findings.extend(check_recruit_at_min_year(lf.clone())?);
+    if options.census_type != CensusType::Single {
+        findings.extend(check_orphan_dead_first_census(&df)?);
+        findings.extend(check_recruit_at_min_year(lf.clone())?);
+    }
 
     Ok(ValidationReport { findings })
 }
@@ -349,14 +358,18 @@ pub fn drop_anchor_rows(lf: LazyFrame) -> LazyFrame {
 
 /// Drop rows that are invalid per GFB3 rules (orphan dead + recruitless DBH).
 /// These are the AutoDrop findings made concrete.
-pub fn drop_invalid_rows(lf: LazyFrame) -> LazyFrame {
-    // Drop: PrevYR null AND Status == "1"
-    let lf = lf.filter(
-        col("PrevYR")
-            .is_null()
-            .and(col("Status").eq(lit(STATUS_DEAD)))
-            .not(),
-    );
+pub fn drop_invalid_rows(lf: LazyFrame, census_type: CensusType) -> LazyFrame {
+    let lf = if census_type == CensusType::Single {
+        lf
+    } else {
+        // Drop: PrevYR null AND Status == "1"
+        lf.filter(
+            col("PrevYR")
+                .is_null()
+                .and(col("Status").eq(lit(STATUS_DEAD)))
+                .not(),
+        )
+    };
     // Drop: Status == "2" AND DBH null
     lf.filter(
         col("Status")
@@ -435,7 +448,7 @@ mod tests {
             &["0", "0"],
             &[Some(10.0), Some(11.0)],
         );
-        let report = validate(df.lazy()).unwrap();
+        let report = validate(df.lazy(), ValidateOptions::default()).unwrap();
         assert!(report.is_clean(), "{:?}", report.findings);
     }
 
@@ -449,7 +462,7 @@ mod tests {
             &["1"],
             &[Some(10.0)], // should be null for dead tree
         );
-        let report = validate(df.lazy()).unwrap();
+        let report = validate(df.lazy(), ValidateOptions::default()).unwrap();
         assert!(report
             .findings
             .iter()
@@ -466,7 +479,7 @@ mod tests {
             &["2"],
             &[None],
         );
-        let report = validate(df.lazy()).unwrap();
+        let report = validate(df.lazy(), ValidateOptions::default()).unwrap();
         assert!(report
             .findings
             .iter()
@@ -483,7 +496,7 @@ mod tests {
             &["1"],
             &[None],
         );
-        let report = validate(df.lazy()).unwrap();
+        let report = validate(df.lazy(), ValidateOptions::default()).unwrap();
         assert!(report
             .findings
             .iter()
@@ -500,11 +513,32 @@ mod tests {
             &["alive"], // not a GFB3 status code
             &[Some(12.0)],
         );
-        let report = validate(df.lazy()).unwrap();
+        let report = validate(df.lazy(), ValidateOptions::default()).unwrap();
         assert!(report
             .findings
             .iter()
             .any(|f| f.rule == ValidationRule::UnknownStatus));
+    }
+
+    #[test]
+    fn single_census_validates_without_prevyr() {
+        let df = DataFrame::new(vec![
+            Column::from(Series::new("PlotID".into(), &["P1"])),
+            Column::from(Series::new("TreeID".into(), &["T1"])),
+            Column::from(Series::new("YR".into(), &[2015u32])),
+            Column::from(Series::new("Status".into(), &["0"])),
+            Column::from(Series::new("DBH".into(), &[Some(10.0f64)])),
+            Column::from(Series::new("gfb3_dsn".into(), &["in_test"])),
+        ])
+        .unwrap();
+        let report = validate(
+            df.lazy(),
+            ValidateOptions {
+                census_type: CensusType::Single,
+            },
+        )
+        .unwrap();
+        assert!(report.is_clean(), "{:?}", report.findings);
     }
 
     #[test]

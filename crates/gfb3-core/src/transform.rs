@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::mapping::ColumnMapping;
+use crate::mapping::CensusType;
 use crate::schema::gfb3_field_defs;
 
 #[derive(Debug, Error)]
@@ -37,6 +38,19 @@ pub fn compute_prev_yr(lf: LazyFrame) -> LazyFrame {
         .shift(lit(1))
         .over([col("PlotID"), col("TreeID")])
         .alias("PrevYR")])
+}
+
+/// Sort, deduplicate, and (for multi-census) compute PrevYR after field mapping.
+pub fn prepare_mapped_frame(lf: LazyFrame, census_type: CensusType) -> LazyFrame {
+    let lf = lf.sort(
+        ["PlotID", "TreeID", "YR"],
+        SortMultipleOptions::default().with_order_descending_multi([false, false, false]),
+    );
+    let lf = dedup(lf);
+    match census_type {
+        CensusType::Multi => compute_prev_yr(lf),
+        CensusType::Single => lf,
+    }
 }
 
 /// Melt a wide-format dataset into long format.
