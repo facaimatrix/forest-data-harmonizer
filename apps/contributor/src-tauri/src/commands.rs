@@ -246,13 +246,18 @@ pub struct StatusVocabRow {
 }
 
 /// Return distinct Status values + their current remap target so the UI can
-/// show the status-vocabulary editor (step 4).
+/// show the status-vocabulary editor (step 5).
 #[command]
 pub async fn get_status_vocab(
     state: tauri::State<'_, AppState>,
+    column: Option<String>,
 ) -> Result<Vec<StatusVocabRow>, String> {
     let guard = state.session.lock().unwrap();
     let session = guard.as_ref().ok_or("no file loaded")?;
+
+    if let Some(col_name) = column.filter(|c| !c.is_empty()) {
+        return status_vocab_counts(&session.raw_df, &col_name, session.mapping.as_ref());
+    }
 
     // Prefer the already-mapped DataFrame; fall back to raw frame.
     let (df, col_name) = if let Some(mapped) = &session.mapped_df {
@@ -460,23 +465,8 @@ pub async fn apply_wide_mapping(
 
     let exprs: Vec<FieldExpr> = request.identity_exprs.iter()
         .filter(|f| f.kind != "lookup")
-        .map(|f| match f.kind.as_str() {
-        "literal" => FieldExpr::Literal {
-            value:      f.value.clone().unwrap_or_default(),
-            target_col: f.target_col.clone(),
-        },
-        "concat" => FieldExpr::Concat {
-            sources:    f.sources.clone().unwrap_or_default(),
-            sep:        f.sep.clone().unwrap_or_else(|| "_".into()),
-            target_col: f.target_col.clone(),
-            to_lower:   f.to_lower.unwrap_or(true),
-            prefix:     f.prefix.clone(),
-        },
-        _ => FieldExpr::Column {
-            source:     f.source.clone().unwrap_or_default(),
-            target_col: f.target_col.clone(),
-        },
-    }).collect();
+        .map(field_expr_from_input)
+        .collect();
 
     let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn);
     let renamed_df = lf.collect().map_err(|e| e.to_string())?;
@@ -486,6 +476,7 @@ pub async fn apply_wide_mapping(
         FieldExpr::Column  { target_col, .. } => target_col.clone(),
         FieldExpr::Literal { target_col, .. } => target_col.clone(),
         FieldExpr::Concat  { target_col, .. } => target_col.clone(),
+        FieldExpr::YearFromColumn { target_col, .. } => target_col.clone(),
     }).collect();
     id_cols.push("gfb3_dsn".to_string());
 
@@ -499,11 +490,7 @@ pub async fn apply_wide_mapping(
     let long_df = melt_wide_to_long(&renamed_df, &id_refs, &pairs_ref)
         .map_err(|e| e.to_string())?;
 
-    let status_remaps: Vec<StatusRemap> = request
-        .status_remaps
-        .into_iter()
-        .map(|r| StatusRemap { source_value: r.source_value, target_code: r.target_code, note: r.note })
-        .collect();
+    let status_remaps = status_remaps_from_input(&request.status_remaps);
     let remap_pairs: Vec<(String, String)> = status_remaps
         .iter()
         .map(|r| (r.source_value.clone(), r.target_code.clone()))
@@ -603,27 +590,14 @@ pub async fn apply_fields_mapping(
 
     let exprs: Vec<FieldExpr> = request.fields.iter()
         .filter(|f| f.kind != "lookup")
-        .map(|f| match f.kind.as_str() {
-        "literal" => FieldExpr::Literal {
-            value:      f.value.clone().unwrap_or_default(),
-            target_col: f.target_col.clone(),
-        },
-        "concat" => FieldExpr::Concat {
-            sources:    f.sources.clone().unwrap_or_default(),
-            sep:        f.sep.clone().unwrap_or_else(|| "_".into()),
-            target_col: f.target_col.clone(),
-            to_lower:   f.to_lower.unwrap_or(true),
-            prefix:     f.prefix.clone(),
-        },
-        _ => FieldExpr::Column {
-            source:     f.source.clone().unwrap_or_default(),
-            target_col: f.target_col.clone(),
-        },
-    }).collect();
+        .map(field_expr_from_input)
+        .collect();
 
     let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn);
 
-    let remap_pairs: Vec<(String, String)> = request.status_remaps.iter()
+    let status_remaps = status_remaps_from_input(&request.status_remaps);
+    let remap_pairs: Vec<(String, String)> = status_remaps
+        .iter()
         .map(|r| (r.source_value.clone(), r.target_code.clone()))
         .collect();
     let lf = if !remap_pairs.is_empty() { apply_status_remap(lf, &remap_pairs) } else { lf };
@@ -653,7 +627,7 @@ pub async fn apply_fields_mapping(
     let mapping = ContributorMapping {
         gfb3_dsn:        request.gfb3_dsn,
         column_mappings: vec![],
-        status_remaps:   vec![],
+        status_remaps,
         needs_pivot:     false,
         wide_dbh_columns: vec![],
         metadata,
@@ -747,6 +721,41 @@ fn parse_census_type(metadata: &MetadataInput) -> CensusType {
         Some("single") | Some("s") => CensusType::Single,
         _ => CensusType::Multi,
     }
+}
+
+fn field_expr_from_input(f: &FieldExprInput) -> FieldExpr {
+    match f.kind.as_str() {
+        "literal" => FieldExpr::Literal {
+            value:      f.value.clone().unwrap_or_default(),
+            target_col: f.target_col.clone(),
+        },
+        "concat" => FieldExpr::Concat {
+            sources:    f.sources.clone().unwrap_or_default(),
+            sep:        f.sep.clone().unwrap_or_else(|| "_".into()),
+            target_col: f.target_col.clone(),
+            to_lower:   f.to_lower.unwrap_or(true),
+            prefix:     f.prefix.clone(),
+        },
+        "year_from_column" => FieldExpr::YearFromColumn {
+            source:     f.source.clone().unwrap_or_default(),
+            target_col: f.target_col.clone(),
+        },
+        _ => FieldExpr::Column {
+            source:     f.source.clone().unwrap_or_default(),
+            target_col: f.target_col.clone(),
+        },
+    }
+}
+
+fn status_remaps_from_input(items: &[StatusRemapInput]) -> Vec<StatusRemap> {
+    items
+        .iter()
+        .map(|r| StatusRemap {
+            source_value: r.source_value.clone(),
+            target_code:  r.target_code.clone(),
+            note:         r.note.clone(),
+        })
+        .collect()
 }
 
 /// Left-join lookup files onto `lf` for any `kind == "lookup"` entries.
