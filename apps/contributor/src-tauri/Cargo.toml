@@ -1,6 +1,6 @@
 [package]
 name    = "contributor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [package.metadata.tauri-build]
@@ -18,6 +18,7 @@ polars     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
+ureq       = { workspace = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
