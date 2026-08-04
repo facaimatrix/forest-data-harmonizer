@@ -2,16 +2,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tauri::command;
 
-use gfb3_core::export::{coerce_status_to_int, draft_filename, write_csv, write_parquet, write_xlsx, Provenance};
+use gfb3_core::export::{
+    coerce_status_to_int, dataset_summary_filename, draft_filename, gfb3_draft_filename,
+    plots_summary_filename, write_csv, write_parquet, write_xlsx, Provenance,
+};
+use gfb3_core::gfb2::gfb3_to_gfb2;
 use gfb3_core::log::CurationLog;
 use gfb3_core::mapping::{
     CensusType, ColumnMapping, ContributorMapping, DatasetMetadata, DbhUnit, StatusRemap,
 };
 use gfb3_core::reader::{dataframe_preview, read_file};
-use gfb3_core::schema::{gfb3_field_defs, Gfb3Field, InputGate};
+use gfb3_core::schema::{
+    gfb2_export_columns, gfb3_export_columns, select_export_columns, with_expan, with_plot_yr,
+    ExpanSpec, Gfb3Field, InputGate,
+};
+use gfb3_core::summary::{build_dataset_summary, build_plots_summary};
+use gfb3_core::tnrs::{
+    build_species_entries, build_tnrs_request, parse_tnrs_response, tnrs_url, TnrsResultRow,
+};
 use gfb3_core::transform::{
     apply_column_mapping, apply_field_exprs, apply_status_remap, derive_status_column,
     melt_wide_to_long, prepare_mapped_frame, scale_dbh_mm_to_cm, DeriveStatusSummary, FieldExpr,
+};
+use gfb3_core::diagnostic::{
+    build_diagnostic_report, write_diagnostic_html, write_diagnostic_pdf, DiagnosticReport,
 };
 use gfb3_core::validation::{
     drop_anchor_rows, drop_invalid_rows, nullify_dead_dbh, recode_unknown_status, sort_for_lag,
@@ -29,7 +43,7 @@ use crate::state::{AppState, SessionState};
 pub struct LoadResult {
     pub columns: Vec<String>,
     pub row_count: usize,
-    /// First 10 rows, row-major, values as strings (nulls → null in JSON).
+    /// First 5 rows, row-major, values as strings (nulls → null in JSON).
     pub preview_rows: Vec<Vec<Option<String>>>,
     /// Plain-language structural gate errors (empty = passed).
     pub gate_errors: Vec<String>,
@@ -64,13 +78,20 @@ pub async fn load_file(
         .collect();
 
     let suggestions = ContributorMapping::suggest_from_headers(&columns);
+    let meta_suggestions = ContributorMapping::suggest_plot_meta_from_headers(&columns);
     let suggested_mappings = columns
         .iter()
         .map(|col| {
             let field = suggestions
                 .iter()
                 .find(|m| &m.source_column == col)
-                .map(|m| format!("{:?}", m.target_field));
+                .map(|m| format!("{:?}", m.target_field))
+                .or_else(|| {
+                    meta_suggestions
+                        .iter()
+                        .find(|(src, _)| src == col)
+                        .map(|(_, tgt)| tgt.clone())
+                });
             SuggestedMapping {
                 source_column: col.clone(),
                 suggested_gfb3_field: field,
@@ -78,7 +99,7 @@ pub async fn load_file(
         })
         .collect();
 
-    let preview_rows = dataframe_preview(&df, 10);
+    let preview_rows = dataframe_preview(&df, 5);
     let row_count = df.height();
 
     *state.session.lock().unwrap() = Some(SessionState {
@@ -87,6 +108,7 @@ pub async fn load_file(
         mapped_df: None,
         mapping: None,
         validation_report: None,
+        diagnostic_report: None,
     });
 
     Ok(LoadResult {
@@ -123,11 +145,33 @@ pub struct MetadataInput {
     pub country: Option<String>,
     pub site: Option<String>,
     pub pi: Option<String>,
+    pub pi_email: Option<String>,
+    pub contact: Option<String>,
+    pub contact_email: Option<String>,
     /// "cm" or "mm"
     pub dbh_unit: Option<String>,
     pub census_years: Vec<u32>,
     /// "single" or "multi" (defaults to multi)
     pub census_type: Option<String>,
+}
+
+fn metadata_from_input(
+    meta: MetadataInput,
+    dbh_unit: Option<DbhUnit>,
+    census_type: CensusType,
+) -> DatasetMetadata {
+    DatasetMetadata {
+        country: meta.country,
+        site: meta.site,
+        pi: meta.pi,
+        pi_email: meta.pi_email,
+        contact: meta.contact,
+        contact_email: meta.contact_email,
+        dbh_unit,
+        coordinate_crs: None,
+        census_years: meta.census_years,
+        census_type,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,15 +228,7 @@ pub async fn apply_mapping(
     };
 
     let census_type = parse_census_type(&request.metadata);
-    let metadata = DatasetMetadata {
-        country: request.metadata.country,
-        site: request.metadata.site,
-        pi: request.metadata.pi,
-        dbh_unit,
-        coordinate_crs: None,
-        census_years: request.metadata.census_years,
-        census_type,
-    };
+    let metadata = metadata_from_input(request.metadata, dbh_unit, census_type);
 
     let mapping = ContributorMapping {
         gfb3_dsn: request.gfb3_dsn.clone(),
@@ -230,6 +266,7 @@ pub async fn apply_mapping(
     session.mapped_df = Some(mapped_df);
     session.mapping = Some(mapping);
     session.validation_report = None;
+    session.diagnostic_report = None;
 
     Ok(ApplyMappingResult { mapped_columns, row_count })
 }
@@ -296,10 +333,24 @@ fn status_vocab_counts(
     let mut counts: HashMap<String, usize> = HashMap::new();
     for i in 0..col.len() {
         let val = col.get(i).unwrap_or(AnyValue::Null);
-        if matches!(val, AnyValue::Null) {
+        let s = match val {
+            AnyValue::Null => continue,
+            AnyValue::String(s) => s.to_string(),
+            AnyValue::StringOwned(s) => s.to_string(),
+            other => {
+                let t = other.to_string();
+                // Strip Polars quoting like "alive" → alive
+                if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+                    t[1..t.len() - 1].to_string()
+                } else {
+                    t
+                }
+            }
+        };
+        if s.trim().is_empty() {
             continue;
         }
-        *counts.entry(val.to_string()).or_insert(0) += 1;
+        *counts.entry(s).or_insert(0) += 1;
     }
 
     let mut rows: Vec<StatusVocabRow> = counts
@@ -317,13 +368,19 @@ fn status_vocab_counts(
 }
 
 // ---------------------------------------------------------------------------
-// Step 5: Validation
+// Step 5: Validation + diagnostic report
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ValidateStepResult {
+    pub validation: ValidationReport,
+    pub diagnostic: DiagnosticReport,
+}
 
 #[command]
 pub async fn run_validation(
     state: tauri::State<'_, AppState>,
-) -> Result<ValidationReport, String> {
+) -> Result<ValidateStepResult, String> {
     let mut guard = state.session.lock().unwrap();
     let session = guard.as_mut().ok_or("no file loaded")?;
 
@@ -336,15 +393,80 @@ pub async fn run_validation(
         .mapping
         .as_ref()
         .map(|m| m.metadata.census_type)
-        .unwrap_or(CensusType::Multi);
+        .unwrap_or_else(|| {
+            // Diagnose mode: infer from lag columns when no mapping metadata exists.
+            let names = df.get_column_names();
+            let has_prev = names.iter().any(|c| c.as_str() == "PrevYR")
+                || names.iter().any(|c| c.as_str() == "PrevDBH");
+            if has_prev {
+                CensusType::Multi
+            } else {
+                CensusType::Single
+            }
+        });
+
+    let dataset_name = session
+        .mapping
+        .as_ref()
+        .map(|m| m.gfb3_dsn.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::path::Path::new(&session.file_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("dataset")
+                .to_string()
+        });
 
     let report = validate(
         df.clone().lazy(),
         ValidateOptions { census_type },
     )
     .map_err(|e| e.to_string())?;
+
+    let diagnostic = build_diagnostic_report(df, census_type, &dataset_name, None, None)
+        .map_err(|e| e.to_string())?;
+
     session.validation_report = Some(report.clone());
-    Ok(report)
+    session.diagnostic_report = Some(diagnostic.clone());
+    Ok(ValidateStepResult {
+        validation: report,
+        diagnostic,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiagnosticExportRequest {
+    pub path: String,
+    /// "pdf" | "html"
+    pub format: String,
+}
+
+#[command]
+pub async fn export_diagnostic_report(
+    state: tauri::State<'_, AppState>,
+    request: DiagnosticExportRequest,
+) -> Result<String, String> {
+    let guard = state.session.lock().unwrap();
+    let session = guard.as_ref().ok_or("no file loaded")?;
+    let report = session
+        .diagnostic_report
+        .as_ref()
+        .ok_or("diagnostic report not available — run validation first")?;
+
+    let path = std::path::Path::new(&request.path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+    }
+
+    match request.format.as_str() {
+        "pdf" => write_diagnostic_pdf(report, path)?,
+        "html" => write_diagnostic_html(report, path).map_err(|e| e.to_string())?,
+        other => return Err(format!("unsupported diagnostic export format: {other}")),
+    }
+    Ok(request.path)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +478,23 @@ pub struct ExportRequest {
     pub output_dir: String,
     pub base_name: String,
     pub formats: Vec<String>,
+    /// Multi-census: drop Status ≠ 0 before GFB2 export (default true).
+    #[serde(default = "default_true")]
+    pub keep_alive_only: bool,
+    /// Fixed-area plots → EXPAN = 1/PA (default true).
+    #[serde(default = "default_true")]
+    pub fixed_area: bool,
+    /// When `fixed_area` is false: Some(v) fills EXPAN with a constant;
+    /// None leaves EXPAN blank ("add later").
+    #[serde(default)]
+    pub constant_expan: Option<f64>,
+    /// Curator of record for the curation-log skeleton.
+    #[serde(default)]
+    pub curator: String,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[command]
@@ -383,39 +522,201 @@ pub async fn export(
         .map(|m| m.metadata.census_type)
         .unwrap_or(CensusType::Multi);
 
-    // Full export pipeline: recode → nullify → drop invalids → drop anchors
-    //                        → sort for lag → coerce status to Int32
-    let lf = mapped_df.clone().lazy();
-    let lf = recode_unknown_status(lf);
-    let lf = nullify_dead_dbh(lf);
-    let lf = drop_invalid_rows(lf, census_type);
-    let lf = if census_type == CensusType::Single {
-        lf
-    } else {
-        drop_anchor_rows(lf)
+    // Shared cleaning before any format branch.
+    let cleaned = {
+        let lf = mapped_df.clone().lazy();
+        let lf = recode_unknown_status(lf);
+        let lf = nullify_dead_dbh(lf);
+        let lf = drop_invalid_rows(lf, census_type);
+        sort_for_lag(lf)
     };
-    let lf = sort_for_lag(lf);
-    let lf = coerce_status_to_int(lf);
-    let export_df = lf.collect().map_err(|e| e.to_string())?;
+
+    // Keep a Status-bearing frame for summaries (before GFB2 strips Status).
+    let cleaned_df = cleaned.collect().map_err(|e| e.to_string())?;
+    let expan_spec = if request.fixed_area {
+        ExpanSpec::FixedArea
+    } else if let Some(v) = request.constant_expan {
+        ExpanSpec::Constant(v)
+    } else {
+        ExpanSpec::Blank
+    };
+    let cleaned_df = with_expan(cleaned_df, expan_spec).map_err(|e| e.to_string())?;
+
+    let gfb2_df = gfb3_to_gfb2(cleaned_df.clone().lazy(), request.keep_alive_only)
+        .map_err(|e| e.to_string())?;
+
+    let selected: Vec<&str> = request
+        .formats
+        .iter()
+        .filter_map(|f| match f.as_str() {
+            "csv" | "parquet" | "xlsx" => Some(f.as_str()),
+            // Legacy aliases from older UI — treat as the base format.
+            "gfb3-csv" | "gfb3_csv" => Some("csv"),
+            "gfb3-parquet" | "gfb3_parquet" => Some("parquet"),
+            "gfb3-xlsx" | "gfb3_xlsx" => Some("xlsx"),
+            "fisi" => None, // removed product
+            _ => None,
+        })
+        .collect();
+    // Deduplicate while preserving order.
+    let mut formats: Vec<&str> = Vec::new();
+    for f in selected {
+        if !formats.contains(&f) {
+            formats.push(f);
+        }
+    }
+    if formats.is_empty() {
+        if let Some(u) = request.formats.iter().find(|f| {
+            !matches!(
+                f.as_str(),
+                "csv"
+                    | "parquet"
+                    | "xlsx"
+                    | "fisi"
+                    | "gfb3-csv"
+                    | "gfb3_csv"
+                    | "gfb3-parquet"
+                    | "gfb3_parquet"
+                    | "gfb3-xlsx"
+                    | "gfb3_xlsx"
+            )
+        }) {
+            return Err(format!("unknown format '{u}'"));
+        }
+        return Err("select at least one format (csv, parquet, or xlsx)".into());
+    }
+
+    // Paired-census GFB3 (multi only)
+    let gfb3_df = if census_type == CensusType::Multi {
+        let lf = drop_anchor_rows(cleaned_df.clone().lazy());
+        let lf = coerce_status_to_int(lf);
+        let df = lf.collect().map_err(|e| e.to_string())?;
+        let df = with_plot_yr(df).map_err(|e| e.to_string())?;
+        Some(select_export_columns(df, gfb3_export_columns()).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
 
     let provenance = Provenance::new_draft(dsn);
     let out_dir = std::path::Path::new(&request.output_dir);
     let mut written: Vec<String> = Vec::new();
 
-    for fmt in &request.formats {
-        let path = out_dir.join(draft_filename(&request.base_name, fmt));
-        let result = match fmt.as_str() {
-            "csv"     => write_csv(export_df.clone(), &path, &provenance),
-            "parquet" => write_parquet(export_df.clone(), &path, &provenance),
-            "xlsx"    => write_xlsx(export_df.clone(), &path, &provenance),
-            other     => return Err(format!("unknown format '{other}'")),
-        };
-        result.map_err(|e| format!("{fmt} export failed: {e}"))?;
-        written.push(path.to_string_lossy().into_owned());
+    let gfb2_write = select_export_columns(gfb2_df, gfb2_export_columns())
+        .map_err(|e| e.to_string())?;
+
+    let empty_meta = DatasetMetadata::default();
+    let meta_ref = session
+        .mapping
+        .as_ref()
+        .map(|m| &m.metadata)
+        .unwrap_or(&empty_meta);
+    let plots_df = build_plots_summary(&cleaned_df).map_err(|e| e.to_string())?;
+    let dataset_df =
+        build_dataset_summary(&cleaned_df, meta_ref, dsn).map_err(|e| e.to_string())?;
+
+    for fmt in formats {
+        // Harmonized tree table (GFB2)
+        match fmt {
+            "csv" => {
+                let path = out_dir.join(draft_filename(&request.base_name, "csv"));
+                write_csv(gfb2_write.clone(), &path, &provenance)
+                    .map_err(|e| format!("gfb2 csv export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "parquet" => {
+                let path = out_dir.join(draft_filename(&request.base_name, "parquet"));
+                write_parquet(gfb2_write.clone(), &path, &provenance)
+                    .map_err(|e| format!("gfb2 parquet export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "xlsx" => {
+                let path = out_dir.join(draft_filename(&request.base_name, "xlsx"));
+                write_xlsx(gfb2_write.clone(), &path, &provenance)
+                    .map_err(|e| format!("gfb2 xlsx export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+
+        // plots_summary
+        match fmt {
+            "csv" => {
+                let path = out_dir.join(plots_summary_filename(&request.base_name, "csv"));
+                write_csv(plots_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("plots_summary csv export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "parquet" => {
+                let path = out_dir.join(plots_summary_filename(&request.base_name, "parquet"));
+                write_parquet(plots_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("plots_summary parquet export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "xlsx" => {
+                let path = out_dir.join(plots_summary_filename(&request.base_name, "xlsx"));
+                write_xlsx(plots_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("plots_summary xlsx export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+
+        // dataset_summary
+        match fmt {
+            "csv" => {
+                let path = out_dir.join(dataset_summary_filename(&request.base_name, "csv"));
+                write_csv(dataset_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("dataset_summary csv export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "parquet" => {
+                let path = out_dir.join(dataset_summary_filename(&request.base_name, "parquet"));
+                write_parquet(dataset_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("dataset_summary parquet export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            "xlsx" => {
+                let path = out_dir.join(dataset_summary_filename(&request.base_name, "xlsx"));
+                write_xlsx(dataset_df.clone(), &path, &provenance)
+                    .map_err(|e| format!("dataset_summary xlsx export failed: {e}"))?;
+                written.push(path.to_string_lossy().into_owned());
+            }
+            _ => {}
+        }
+
+        // GFB3 paired-census (multi only)
+        if let Some(df) = gfb3_df.as_ref() {
+            match fmt {
+                "csv" => {
+                    let path = out_dir.join(gfb3_draft_filename(&request.base_name, "csv"));
+                    write_csv(df.clone(), &path, &provenance)
+                        .map_err(|e| format!("gfb3 csv export failed: {e}"))?;
+                    written.push(path.to_string_lossy().into_owned());
+                }
+                "parquet" => {
+                    let path = out_dir.join(gfb3_draft_filename(&request.base_name, "parquet"));
+                    write_parquet(df.clone(), &path, &provenance)
+                        .map_err(|e| format!("gfb3 parquet export failed: {e}"))?;
+                    written.push(path.to_string_lossy().into_owned());
+                }
+                "xlsx" => {
+                    let path = out_dir.join(gfb3_draft_filename(&request.base_name, "xlsx"));
+                    write_xlsx(df.clone(), &path, &provenance)
+                        .map_err(|e| format!("gfb3 xlsx export failed: {e}"))?;
+                    written.push(path.to_string_lossy().into_owned());
+                }
+                _ => {}
+            }
+        }
     }
 
     // Curation log skeleton
-    let mut log = CurationLog::new("Francisco Rivas");
+    let curator = if request.curator.trim().is_empty() {
+        "Unknown"
+    } else {
+        request.curator.trim()
+    };
+    let mut log = CurationLog::new(curator);
     if let Some(mapping) = &session.mapping {
         log.prefill_from_metadata(&mapping.metadata, &mapping.gfb3_dsn);
     }
@@ -468,17 +769,18 @@ pub async fn apply_wide_mapping(
         .map(field_expr_from_input)
         .collect();
 
-    let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn);
+    let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn)
+        .map_err(|e| e.to_string())?;
     let renamed_df = lf.collect().map_err(|e| e.to_string())?;
 
-    // id_cols = target column names from the exprs + gfb3_dsn.
+    // id_cols = target column names from the exprs + in_dsn.
     let mut id_cols: Vec<String> = exprs.iter().map(|e| match e {
         FieldExpr::Column  { target_col, .. } => target_col.clone(),
         FieldExpr::Literal { target_col, .. } => target_col.clone(),
         FieldExpr::Concat  { target_col, .. } => target_col.clone(),
         FieldExpr::YearFromColumn { target_col, .. } => target_col.clone(),
     }).collect();
-    id_cols.push("gfb3_dsn".to_string());
+    id_cols.push("in_dsn".to_string());
 
     let id_refs: Vec<&str> = id_cols.iter().map(|s| s.as_str()).collect();
     let pairs_ref: Vec<(&str, u32)> = request
@@ -514,15 +816,7 @@ pub async fn apply_wide_mapping(
         mapped_df.get_column_names().iter().map(|s| s.to_string()).collect();
     let row_count = mapped_df.height();
 
-    let metadata = DatasetMetadata {
-        country: request.metadata.country,
-        site: request.metadata.site,
-        pi: request.metadata.pi,
-        dbh_unit,
-        coordinate_crs: None,
-        census_years: request.metadata.census_years,
-        census_type,
-    };
+    let metadata = metadata_from_input(request.metadata, dbh_unit, census_type);
     let mapping = ContributorMapping {
         gfb3_dsn: request.gfb3_dsn.clone(),
         column_mappings: vec![],
@@ -535,6 +829,7 @@ pub async fn apply_wide_mapping(
     session.mapped_df = Some(mapped_df);
     session.mapping = Some(mapping);
     session.validation_report = None;
+    session.diagnostic_report = None;
 
     Ok(ApplyMappingResult { mapped_columns, row_count })
 }
@@ -593,7 +888,8 @@ pub async fn apply_fields_mapping(
         .map(field_expr_from_input)
         .collect();
 
-    let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn);
+    let lf = apply_field_exprs(lf, &exprs, &request.gfb3_dsn)
+        .map_err(|e| e.to_string())?;
 
     let status_remaps = status_remaps_from_input(&request.status_remaps);
     let remap_pairs: Vec<(String, String)> = status_remaps
@@ -615,15 +911,7 @@ pub async fn apply_fields_mapping(
     let mapped_columns: Vec<String> = mapped_df.get_column_names().iter().map(|s| s.to_string()).collect();
     let row_count = mapped_df.height();
 
-    let metadata = DatasetMetadata {
-        country:        request.metadata.country,
-        site:           request.metadata.site,
-        pi:             request.metadata.pi,
-        dbh_unit:       dbh_unit_enum,
-        coordinate_crs: None,
-        census_years:   request.metadata.census_years,
-        census_type,
-    };
+    let metadata = metadata_from_input(request.metadata, dbh_unit_enum, census_type);
     let mapping = ContributorMapping {
         gfb3_dsn:        request.gfb3_dsn,
         column_mappings: vec![],
@@ -636,6 +924,7 @@ pub async fn apply_fields_mapping(
     session.mapped_df = Some(mapped_df);
     session.mapping = Some(mapping);
     session.validation_report = None;
+    session.diagnostic_report = None;
 
     Ok(ApplyMappingResult { mapped_columns, row_count })
 }
@@ -709,6 +998,7 @@ pub async fn use_raw_as_gfb3(
 
     session.mapped_df = Some(raw_df);
     session.validation_report = None;
+    session.diagnostic_report = None;
     Ok(ApplyMappingResult { mapped_columns, row_count })
 }
 
@@ -802,4 +1092,330 @@ fn parse_gfb3_field(s: &str) -> Option<Gfb3Field> {
         "Dsn"     => Some(Gfb3Field::Dsn),
         _         => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Species / TNRS
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct SpeciesResolveResponse {
+    pub results: Vec<TnrsResultRow>,
+    pub skipped: bool,
+    pub message: Option<String>,
+}
+
+/// Collect unique Species values, flag near-duplicates, and resolve via TNRS.
+#[command]
+pub async fn resolve_species_tnrs(
+    state: tauri::State<'_, AppState>,
+) -> Result<SpeciesResolveResponse, String> {
+    let guard = state.session.lock().unwrap();
+    let session = guard.as_ref().ok_or("no file loaded")?;
+    let df = session
+        .mapped_df
+        .as_ref()
+        .ok_or("apply field mapping before species resolution")?;
+
+    if !df.get_column_names().iter().any(|c| c.as_str() == "Species") {
+        return Ok(SpeciesResolveResponse {
+            results: vec![],
+            skipped: true,
+            message: Some("No Species column — nothing to resolve.".into()),
+        });
+    }
+
+    let col = df.column("Species").map_err(|e| e.to_string())?;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for i in 0..col.len() {
+        let val = col.get(i).unwrap_or(AnyValue::Null);
+        if matches!(val, AnyValue::Null) {
+            continue;
+        }
+        let s = val.to_string();
+        if s.trim().is_empty() {
+            continue;
+        }
+        *counts.entry(s).or_insert(0) += 1;
+    }
+
+    if counts.is_empty() {
+        return Ok(SpeciesResolveResponse {
+            results: vec![],
+            skipped: true,
+            message: Some("Species column is empty.".into()),
+        });
+    }
+
+    let entries = build_species_entries(&counts);
+    // Near-duplicate-only preview if TNRS is unreachable
+    let body = build_tnrs_request(&entries);
+    let body_json = serde_json::to_string(&body).map_err(|e| e.to_string())?;
+
+    let resp = ureq::post(tnrs_url())
+        .set("Content-Type", "application/json")
+        .set("Accept", "application/json")
+        .set("charset", "UTF-8")
+        .send_string(&body_json);
+
+    match resp {
+        Ok(r) => {
+            let raw: serde_json::Value = r.into_json().map_err(|e| format!("TNRS JSON: {e}"))?;
+            let results = parse_tnrs_response(&raw, &entries)?;
+            Ok(SpeciesResolveResponse {
+                results,
+                skipped: false,
+                message: None,
+            })
+        }
+        Err(e) => {
+            // Offline fallback: still return near-duplicate highlights
+            let results: Vec<TnrsResultRow> = entries
+                .iter()
+                .map(|e| TnrsResultRow {
+                    original: e.original.clone(),
+                    matches: vec![],
+                    best_accepted: None,
+                    ambiguous: !e.near_duplicates.is_empty(),
+                    near_duplicates: e.near_duplicates.clone(),
+                })
+                .collect();
+            Ok(SpeciesResolveResponse {
+                results,
+                skipped: false,
+                message: Some(format!(
+                    "TNRS unreachable ({e}). Near-duplicate highlights are still shown — pick names manually or retry."
+                )),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SpeciesRemapInput {
+    pub original: String,
+    pub resolved: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApplySpeciesRequest {
+    pub remaps: Vec<SpeciesRemapInput>,
+}
+
+/// Apply chosen species resolutions onto the mapped DataFrame.
+#[command]
+pub async fn apply_species_resolutions(
+    state: tauri::State<'_, AppState>,
+    request: ApplySpeciesRequest,
+) -> Result<ApplyMappingResult, String> {
+    let mut guard = state.session.lock().unwrap();
+    let session = guard.as_mut().ok_or("no file loaded")?;
+    let df = session
+        .mapped_df
+        .as_ref()
+        .ok_or("no mapped data")?
+        .clone();
+
+    if request.remaps.is_empty() {
+        let mapped_columns = df.get_column_names().iter().map(|s| s.to_string()).collect();
+        let row_count = df.height();
+        return Ok(ApplyMappingResult {
+            mapped_columns,
+            row_count,
+        });
+    }
+
+    use polars::prelude::{col, lit, when};
+    let mut expr = col("Species").cast(DataType::String);
+    for r in &request.remaps {
+        if r.original == r.resolved {
+            continue;
+        }
+        expr = when(col("Species").cast(DataType::String).eq(lit(r.original.clone())))
+            .then(lit(r.resolved.clone()))
+            .otherwise(expr);
+    }
+    let mapped_df = df
+        .lazy()
+        .with_columns([expr.alias("Species")])
+        .collect()
+        .map_err(|e| e.to_string())?;
+    let mapped_columns = mapped_df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let row_count = mapped_df.height();
+    session.mapped_df = Some(mapped_df);
+    Ok(ApplyMappingResult {
+        mapped_columns,
+        row_count,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Map tab: extract plot / tree coordinates from the loaded dataframe
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct MapPoint {
+    pub lat: f64,
+    pub lon: f64,
+    pub label: Option<String>,
+    pub plot_id: Option<String>,
+    pub symbol: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MapPointsResult {
+    pub points: Vec<MapPoint>,
+    pub total_rows_scanned: usize,
+    pub truncated: bool,
+}
+
+fn anyvalue_to_f64(v: &AnyValue) -> Option<f64> {
+    match v {
+        AnyValue::Null => None,
+        AnyValue::Float64(x) => Some(*x),
+        AnyValue::Float32(x) => Some(f64::from(*x)),
+        AnyValue::Int64(x) => Some(*x as f64),
+        AnyValue::Int32(x) => Some(f64::from(*x)),
+        AnyValue::Int16(x) => Some(f64::from(*x)),
+        AnyValue::Int8(x) => Some(f64::from(*x)),
+        AnyValue::UInt64(x) => Some(*x as f64),
+        AnyValue::UInt32(x) => Some(f64::from(*x)),
+        AnyValue::UInt16(x) => Some(f64::from(*x)),
+        AnyValue::UInt8(x) => Some(f64::from(*x)),
+        AnyValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f64>().ok()
+            }
+        }
+        AnyValue::StringOwned(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                t.parse::<f64>().ok()
+            }
+        }
+        _ => None,
+    }
+}
+
+fn anyvalue_to_label(v: &AnyValue) -> Option<String> {
+    match v {
+        AnyValue::Null => None,
+        AnyValue::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        AnyValue::StringOwned(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        other => Some(format!("{other}")),
+    }
+}
+
+#[tauri::command]
+pub async fn get_map_points(
+    state: tauri::State<'_, AppState>,
+    lat_col: String,
+    lon_col: String,
+    label_col: Option<String>,
+    symbol_col: Option<String>,
+    max_points: Option<usize>,
+) -> Result<MapPointsResult, String> {
+    let guard = state.session.lock().unwrap();
+    let session = guard.as_ref().ok_or("No file loaded. Load a dataset first.")?;
+    let df = &session.raw_df;
+
+    let limit = max_points.unwrap_or(25_000).min(100_000);
+    let n = df.height();
+    let lat_s = df.column(&lat_col).map_err(|_| {
+        format!("Latitude column “{lat_col}” not found in the loaded file.")
+    })?;
+    let lon_s = df.column(&lon_col).map_err(|_| {
+        format!("Longitude column “{lon_col}” not found in the loaded file.")
+    })?;
+    let label_s = match label_col.as_deref() {
+        Some(c) if !c.is_empty() => Some(df.column(c).map_err(|_| {
+            format!("Label column “{c}” not found in the loaded file.")
+        })?),
+        _ => None,
+    };
+    let symbol_s = match symbol_col.as_deref() {
+        Some(c) if !c.is_empty() => Some(df.column(c).map_err(|_| {
+            format!("Symbol column “{c}” not found in the loaded file.")
+        })?),
+        _ => None,
+    };
+    let plot_s = df.column("PlotID").ok();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut points = Vec::new();
+    let mut truncated = false;
+
+    for i in 0..n {
+        let lat = anyvalue_to_f64(&lat_s.get(i).map_err(|e| e.to_string())?);
+        let lon = anyvalue_to_f64(&lon_s.get(i).map_err(|e| e.to_string())?);
+        let (Some(lat), Some(lon)) = (lat, lon) else {
+            continue;
+        };
+        if !lat.is_finite() || !lon.is_finite() {
+            continue;
+        }
+        // Deduplicate at ~1e-6 deg (~10 cm) to keep the map readable
+        let key = ((lat * 1e6).round() as i64, (lon * 1e6).round() as i64);
+        if !seen.insert(key) {
+            continue;
+        }
+        if points.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let plot_id = plot_s
+            .as_ref()
+            .and_then(|s| s.get(i).ok())
+            .and_then(|v| anyvalue_to_label(&v));
+        let label = label_s
+            .as_ref()
+            .and_then(|s| s.get(i).ok())
+            .and_then(|v| anyvalue_to_label(&v))
+            .or_else(|| plot_id.clone());
+        let symbol = symbol_s
+            .as_ref()
+            .and_then(|s| s.get(i).ok())
+            .and_then(|v| anyvalue_to_label(&v));
+        points.push(MapPoint {
+            lat,
+            lon,
+            label,
+            plot_id,
+            symbol,
+        });
+    }
+
+    Ok(MapPointsResult {
+        points,
+        total_rows_scanned: n,
+        truncated,
+    })
+}
+
+#[tauri::command]
+pub async fn save_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents.as_bytes()).map_err(|e| e.to_string())
 }

@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="style.css" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/proj4@2.11.0/dist/proj4.js"></script>
 </head>
 <body>
   <header>
@@ -14,7 +15,13 @@
       <img src="dh-logo.png" alt="Forest Data Harmonizer" class="header-logo" />
       <span id="header-subtitle">Contributor draft tool</span>
     </div>
-    <div id="lang-switcher" class="lang-switcher"></div>
+    <div class="header-right">
+      <nav id="workspace-tabs" class="workspace-tabs" aria-label="Workspace">
+        <button type="button" class="workspace-tab active" data-view="workflow" id="tab-workflow">Workflow</button>
+        <button type="button" class="workspace-tab" data-view="map" id="tab-map">Map</button>
+      </nav>
+      <div id="lang-switcher" class="lang-switcher"></div>
+    </div>
   </header>
 
   <div id="step-indicator"></div>

@@ -19,6 +19,7 @@ pub enum ReadError {
 }
 
 /// Dispatch to the correct reader based on file extension.
+/// Empty / spacer columns are dropped; blank headers are renamed.
 pub fn read_file(path: &Path) -> Result<DataFrame, ReadError> {
     let ext = path
         .extension()
@@ -26,12 +27,71 @@ pub fn read_file(path: &Path) -> Result<DataFrame, ReadError> {
         .unwrap_or("")
         .to_lowercase();
 
-    match ext.as_str() {
-        "xlsx" | "xls" | "ods" => read_xlsx(path),
-        "csv" | "tsv" => read_csv(path),
-        "parquet" => read_parquet(path),
-        other => Err(ReadError::UnsupportedExtension(other.to_string())),
+    let df = match ext.as_str() {
+        "xlsx" | "xls" | "ods" => read_xlsx(path)?,
+        "csv" | "tsv" => read_csv(path)?,
+        "parquet" => read_parquet(path)?,
+        other => return Err(ReadError::UnsupportedExtension(other.to_string())),
+    };
+
+    Ok(normalize_dataframe(df))
+}
+
+/// Drop all-null columns and fix blank / duplicate header names.
+pub fn normalize_dataframe(df: DataFrame) -> DataFrame {
+    let height = df.height();
+    if height == 0 {
+        return df;
     }
+
+    let non_empty: Vec<Column> = df
+        .get_columns()
+        .iter()
+        .filter(|s| s.null_count() < height)
+        .cloned()
+        .map(Column::from)
+        .collect();
+
+    if non_empty.is_empty() {
+        return df;
+    }
+
+    let mut df = DataFrame::new(non_empty).unwrap_or(df);
+
+    let old_names: Vec<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let new_names: Vec<String> = old_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let trimmed = name.trim();
+            let base = if trimmed.is_empty() || name.starts_with("column_") {
+                format!("_unnamed_{}", i + 1)
+            } else {
+                trimmed.to_string()
+            };
+            let count = seen.entry(base.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                base
+            } else {
+                format!("{}_{}", base, count)
+            }
+        })
+        .collect();
+
+    for (old, new) in old_names.iter().zip(new_names.iter()) {
+        if old != new {
+            let _ = df.rename(old, new.as_str().into());
+        }
+    }
+
+    df
 }
 
 /// Read the first sheet of an XLSX/XLS/ODS file into a DataFrame.
@@ -140,4 +200,24 @@ pub fn dataframe_preview(df: &DataFrame, n_rows: usize) -> Vec<Vec<Option<String
                 .collect()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polars::prelude::*;
+
+    #[test]
+    fn normalize_drops_all_null_and_blank_headers() {
+        let df = DataFrame::new(vec![
+            Column::from(Series::new("PlotID".into(), &["P1", "P2"])),
+            Column::from(Series::new("".into(), &[None::<String>, None])),
+            Column::from(Series::new("DBH".into(), &[Some(10.0), Some(12.0)])),
+        ])
+        .unwrap();
+        let out = normalize_dataframe(df);
+        assert_eq!(out.width(), 2);
+        assert!(out.get_column_names().iter().any(|n| n.as_str() == "PlotID"));
+        assert!(out.get_column_names().iter().any(|n| n.as_str() == "DBH"));
+    }
 }

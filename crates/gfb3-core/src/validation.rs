@@ -102,7 +102,7 @@ pub struct ValidateOptions {
 /// Run all GFB3 validation checks against a mapped, pre-pivot LazyFrame.
 ///
 /// The LazyFrame must already have canonical GFB3 column names (PlotID, TreeID,
-/// YR, Status, DBH, gfb3_dsn). Multi-census data must also have PrevYR.
+/// YR, Status, DBH, in_dsn). Multi-census data must also have PrevYR.
 /// Status must be a String column.
 pub fn validate(lf: LazyFrame, options: ValidateOptions) -> Result<ValidationReport, ValidationError> {
     let mut findings = Vec::new();
@@ -528,7 +528,7 @@ mod tests {
             Column::from(Series::new("YR".into(), &[2015u32])),
             Column::from(Series::new("Status".into(), &["0"])),
             Column::from(Series::new("DBH".into(), &[Some(10.0f64)])),
-            Column::from(Series::new("gfb3_dsn".into(), &["in_test"])),
+            Column::from(Series::new("in_dsn".into(), &["in_test"])),
         ])
         .unwrap();
         let report = validate(

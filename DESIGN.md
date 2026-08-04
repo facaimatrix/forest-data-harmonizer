@@ -37,18 +37,21 @@ one clean table per dataset"), not a blind precondition.
 1. **Dataset-level declarations the table often omits** — plots covered, census
    years, DBH units (cm vs mm), coordinate CRS, country/site. The contributor
    uniquely knows these and they are invisible in the raw numbers.
-2. **Column mapping** — source columns → GFB3 fields, fuzzy auto-suggested from
-   headers. Save the mapping keyed to the contributor's `gfb3_dsn` so repeat
-   submissions reuse it.
+2. **Column mapping** — source columns → GFB fields, fuzzy auto-suggested from
+   headers. Save the mapping keyed to the contributor's `in_dsn` so repeat
+   submissions reuse it. Also ask whether plots are **fixed-area** (default Yes):
+   if Yes, tree-level `EXPAN` (expansion factor) = `1/PA`; if No, enter a
+   constant EXPAN or leave blank ("Add later").
 3. **Shape** — detect wide format; offer a pivot/melt wizard if per-census
    year-columns exist ("tell me which columns are per-census DBH; I'll reshape").
-4. **Status vocabulary → GFB3 status** — contributor maps their codes
-   (alive/dead/recruit/"chopped down"/n-a) to GFB3 status, with conservative
+4. **Status vocabulary → GFB status** — contributor maps their codes
+   (alive/dead/recruit/"chopped down"/n-a) to GFB status, with conservative
    defaults wired in (ambiguous → 9; anthropogenic removal → 1 with note kept).
-5. **Validation** — run the GFB3 checks (see below); show flagged rows in plain
+5. **Validation** — run the integrity checks (see below); show flagged rows in plain
    language for the contributor to resolve or escalate to the log.
 6. **Export** — all three formats, `_DRAFT` suffix + embedded provenance, plus a
-   metadata sidecar and a curation-log skeleton.
+   metadata sidecar and a curation-log skeleton. Tree tables include `PA` and
+   `EXPAN` when available.
 
 ## Validation checks (port of report_gfb3 semantics)
 - Duplicate TreeID within Plot + Year (dedup must run before any lag).
@@ -78,7 +81,7 @@ DATASET:
 COUNTRY:
 SITE:
 PI:
-CURATOR: Francisco Rivas
+CURATOR: Vandana Shiva
 DATE RECEIVED:
 DATE PROCESSED:
 --- SOURCE FORMAT ---

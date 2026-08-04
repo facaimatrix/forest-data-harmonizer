@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use gfb3_core::diagnostic::DiagnosticReport;
 use gfb3_core::mapping::ContributorMapping;
 use gfb3_core::validation::ValidationReport;
 use polars::prelude::DataFrame;
@@ -14,6 +15,8 @@ pub struct SessionState {
     pub mapping: Option<ContributorMapping>,
     /// Set after the validation step is run.
     pub validation_report: Option<ValidationReport>,
+    /// Facai-style diagnostic report (GFB2 / GFB3).
+    pub diagnostic_report: Option<DiagnosticReport>,
 }
 
 /// Shared application state held by Tauri across IPC calls.

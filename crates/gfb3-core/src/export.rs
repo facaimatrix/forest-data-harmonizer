@@ -28,28 +28,28 @@ pub struct Provenance {
     pub build: BuildKind,
     pub app_version: String,
     pub schema_version: String,
-    pub gfb3_dsn: String,
+    pub in_dsn: String,
     pub timestamp: String,
 }
 
 impl Provenance {
-    pub fn new_draft(gfb3_dsn: &str) -> Self {
+    pub fn new_draft(in_dsn: &str) -> Self {
         Provenance {
             build: BuildKind::Draft,
             app_version: APP_VERSION.to_string(),
             schema_version: SCHEMA_VERSION.to_string(),
-            gfb3_dsn: gfb3_dsn.to_string(),
+            in_dsn: in_dsn.to_string(),
             timestamp: Utc::now().to_rfc3339(),
         }
     }
 
     pub fn csv_header_comment(&self) -> String {
         format!(
-            "# build={} app_version={} schema_version={} gfb3_dsn={} timestamp={}",
+            "# build={} app_version={} schema_version={} in_dsn={} timestamp={}",
             self.build.stamp(),
             self.app_version,
             self.schema_version,
-            self.gfb3_dsn,
+            self.in_dsn,
             self.timestamp
         )
     }
@@ -78,6 +78,21 @@ pub fn draft_filename(base_name: &str, ext: &str) -> String {
     format!("{}_DRAFT.{}", base_name, ext)
 }
 
+/// Draft filename for paired-census GFB3 exports.
+pub fn gfb3_draft_filename(base_name: &str, ext: &str) -> String {
+    format!("{}_GFB3_DRAFT.{}", base_name, ext)
+}
+
+/// Draft filename for the plot-level summary table.
+pub fn plots_summary_filename(base_name: &str, ext: &str) -> String {
+    format!("{}_plots_summary_DRAFT.{}", base_name, ext)
+}
+
+/// Draft filename for the dataset-level summary table.
+pub fn dataset_summary_filename(base_name: &str, ext: &str) -> String {
+    format!("{}_dataset_summary_DRAFT.{}", base_name, ext)
+}
+
 // ---------------------------------------------------------------------------
 // CSV
 // ---------------------------------------------------------------------------
@@ -89,6 +104,14 @@ pub fn write_csv(mut df: DataFrame, path: &Path, provenance: &Provenance) -> Res
 
     writeln!(writer, "{}", provenance.csv_header_comment())?;
     CsvWriter::new(&mut writer)
+        .finish(&mut df)
+        .map_err(ExportError::Polars)
+}
+
+/// Write a DataFrame to CSV with no provenance preamble (header row first).
+pub fn write_csv_plain(mut df: DataFrame, path: &Path) -> Result<(), ExportError> {
+    let file = std::fs::File::create(path)?;
+    CsvWriter::new(file)
         .finish(&mut df)
         .map_err(ExportError::Polars)
 }
@@ -158,7 +181,7 @@ pub fn write_xlsx(df: DataFrame, path: &Path, provenance: &Provenance) -> Result
             ("build",          provenance.build.stamp()),
             ("app_version",    &provenance.app_version),
             ("schema_version", &provenance.schema_version),
-            ("gfb3_dsn",       &provenance.gfb3_dsn),
+            ("in_dsn",         &provenance.in_dsn),
             ("timestamp",      &provenance.timestamp),
         ];
         for (i, (key, val)) in fields.iter().enumerate() {

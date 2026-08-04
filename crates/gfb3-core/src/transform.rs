@@ -14,6 +14,8 @@ pub enum TransformError {
     Pivot(String),
     #[error("deduplication failed: no sort key columns found")]
     MissingSortKey,
+    #[error("{0}")]
+    Msg(String),
 }
 
 /// Deduplicate by (PlotID, TreeID, YR), keeping the first occurrence after
@@ -40,7 +42,15 @@ pub fn compute_prev_yr(lf: LazyFrame) -> LazyFrame {
         .alias("PrevYR")])
 }
 
-/// Sort, deduplicate, and (for multi-census) compute PrevYR after field mapping.
+/// Compute the PrevDBH column as the lag-1 DBH per (PlotID, TreeID).
+pub fn compute_prev_dbh(lf: LazyFrame) -> LazyFrame {
+    lf.with_columns([col("DBH")
+        .shift(lit(1))
+        .over([col("PlotID"), col("TreeID")])
+        .alias("PrevDBH")])
+}
+
+/// Sort, deduplicate, and (for multi-census) compute PrevYR + PrevDBH after field mapping.
 pub fn prepare_mapped_frame(lf: LazyFrame, census_type: CensusType) -> LazyFrame {
     let lf = lf.sort(
         ["PlotID", "TreeID", "YR"],
@@ -48,7 +58,7 @@ pub fn prepare_mapped_frame(lf: LazyFrame, census_type: CensusType) -> LazyFrame
     );
     let lf = dedup(lf);
     match census_type {
-        CensusType::Multi => compute_prev_yr(lf),
+        CensusType::Multi => compute_prev_dbh(compute_prev_yr(lf)),
         CensusType::Single => lf,
     }
 }
@@ -56,7 +66,7 @@ pub fn prepare_mapped_frame(lf: LazyFrame, census_type: CensusType) -> LazyFrame
 /// Melt a wide-format dataset into long format.
 ///
 /// `id_columns`: columns shared across all censuses (e.g. PlotID, TreeID, Status, Species,
-///   gfb3_dsn). These are kept on every output row.
+///   in_dsn). These are kept on every output row.
 /// `dbh_pairs`: `(source_column_name, census_year)` — each DBH column paired with its year.
 ///
 /// Produces a long-format `DataFrame` with `id_columns` + `DBH` (f64) + `YR` (i32).
@@ -111,7 +121,7 @@ pub fn apply_status_remap(lf: LazyFrame, remap: &[(String, String)]) -> LazyFram
     lf.with_columns([expr.alias("Status")])
 }
 
-/// Rename source columns to their canonical GFB3 names and add a `gfb3_dsn`
+/// Rename source columns to their canonical GFB3 names and add an `in_dsn`
 /// literal column.  Columns not present in `mappings` are kept unchanged
 /// (they will be non-GFB3 extras; cast to String when binding multiple files).
 ///
@@ -138,7 +148,7 @@ pub fn apply_column_mapping(
 
     // `strict = false` so columns absent from the frame are silently skipped.
     lf.rename(old_names, new_names, false)
-        .with_columns([lit(gfb3_dsn.to_string()).alias("gfb3_dsn")])
+        .with_columns([lit(gfb3_dsn.to_string()).alias("in_dsn")])
 }
 
 /// Scale DBH from mm to cm (divide by 10).  Only call when the source unit
@@ -360,6 +370,8 @@ fn add_disappeared_rows(df: DataFrame, global_max_yr: i64, treatment: &str) -> R
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FieldExpr {
     Column  { source: String, target_col: String },
+    /// Map a source column to YR, extracting a 4-digit year from dates or integers.
+    YearFromColumn { source: String, target_col: String },
     Literal { value: String,  target_col: String },
     Concat  { sources: Vec<String>, sep: String, target_col: String, to_lower: bool, prefix: Option<String> },
 }
@@ -367,17 +379,60 @@ pub enum FieldExpr {
 /// Apply the field wizard's field expressions to the raw DataFrame.
 /// Each expr produces one GFB3-named column; columns not covered by any expr
 /// are left as-is (extra/non-GFB3 columns are harmless at this stage).
-pub fn apply_field_exprs(lf: LazyFrame, exprs: &[FieldExpr], gfb3_dsn: &str) -> LazyFrame {
-    let mut lf = lf.with_columns([lit(gfb3_dsn).alias("gfb3_dsn")]);
+///
+/// Returns an error if a required source column is missing or a Concat would
+/// produce no columns (avoids a cryptic later failure in `prepare_mapped_frame`).
+pub fn apply_field_exprs(
+    lf: LazyFrame,
+    exprs: &[FieldExpr],
+    gfb3_dsn: &str,
+) -> Result<LazyFrame, TransformError> {
+    let mut lf = lf.with_columns([lit(gfb3_dsn).alias("in_dsn")]);
 
     for expr in exprs {
         lf = match expr {
             FieldExpr::Column { source, target_col } => {
                 if source == target_col {
+                    // Already canonical — verify it exists.
+                    let schema = lf
+                        .collect_schema()
+                        .map_err(|e| TransformError::Polars(e))?;
+                    if schema.get(source).is_none() {
+                        return Err(TransformError::Msg(format!(
+                            "column '{source}' not found in the data (needed for {target_col})"
+                        )));
+                    }
                     lf
                 } else {
-                    lf.rename([source.clone()], [target_col.clone()], false)
+                    // Prefer alias over rename: rename(..., strict=false) silently
+                    // no-ops when the source name is wrong, which later fails as
+                    // "PlotID not found" at sort time.
+                    let schema = lf
+                        .collect_schema()
+                        .map_err(|e| TransformError::Polars(e))?;
+                    if schema.get(source).is_none() {
+                        return Err(TransformError::Msg(format!(
+                            "column '{source}' not found in the data (needed for {target_col})"
+                        )));
+                    }
+                    lf.with_columns([col(source.as_str()).alias(target_col.as_str())])
                 }
+            }
+            FieldExpr::YearFromColumn { source, target_col } => {
+                let schema = lf
+                    .collect_schema()
+                    .map_err(|e| TransformError::Polars(e))?;
+                if schema.get(source).is_none() {
+                    return Err(TransformError::Msg(format!(
+                        "column '{source}' not found in the data (needed for {target_col})"
+                    )));
+                }
+                let as_str = col(source.as_str()).cast(DataType::String);
+                let extracted = as_str.clone().str().extract(lit(r"(\d{4})"), 1);
+                lf.with_columns([when(extracted.clone().is_not_null())
+                    .then(extracted.cast(DataType::UInt32))
+                    .otherwise(col(source.as_str()).cast(DataType::UInt32))
+                    .alias(target_col.as_str())])
             }
             FieldExpr::Literal { value, target_col } => {
                 // Parse as f64 for numeric GFB3 fields (Latitude, Longitude, PA)
@@ -388,13 +443,37 @@ pub fn apply_field_exprs(lf: LazyFrame, exprs: &[FieldExpr], gfb3_dsn: &str) -> 
                 }
             }
             FieldExpr::Concat { sources, sep, target_col, to_lower, prefix } => {
+                let schema = lf
+                    .collect_schema()
+                    .map_err(|e| TransformError::Polars(e))?;
+                // Keep sources that exist. Drop a self-named source only when
+                // that name is not already a physical column.
+                let mut resolved: Vec<&str> = Vec::new();
+                for s in sources {
+                    let name = s.as_str();
+                    if schema.get(name).is_some() {
+                        resolved.push(name);
+                    } else if name == target_col.as_str() {
+                        // Self-ref before the column exists — skip.
+                        continue;
+                    } else {
+                        return Err(TransformError::Msg(format!(
+                            "column '{name}' not found in the data (needed to build {target_col})"
+                        )));
+                    }
+                }
                 let mut col_exprs: Vec<Expr> = Vec::new();
                 if let Some(pfx) = prefix {
                     if !pfx.is_empty() {
                         col_exprs.push(lit(pfx.clone()).cast(DataType::String));
                     }
                 }
-                col_exprs.extend(sources.iter().map(|s| col(s.as_str()).cast(DataType::String)));
+                col_exprs.extend(resolved.iter().map(|s| col(*s).cast(DataType::String)));
+                if col_exprs.is_empty() {
+                    return Err(TransformError::Msg(format!(
+                        "cannot build {target_col}: no source columns or prefix provided"
+                    )));
+                }
                 let concat_expr = polars::prelude::concat_str(col_exprs, sep.as_str(), true);
                 let concat_expr = if *to_lower {
                     concat_expr.str().to_lowercase()
@@ -405,5 +484,231 @@ pub fn apply_field_exprs(lf: LazyFrame, exprs: &[FieldExpr], gfb3_dsn: &str) -> 
             }
         };
     }
-    lf
+
+    // Hard check before sort/lag — much clearer than Polars "PlotID not found".
+    let schema = lf
+        .collect_schema()
+        .map_err(|e| TransformError::Polars(e))?;
+    for need in ["PlotID", "TreeID", "YR"] {
+        if schema.get(need).is_none() {
+            return Err(TransformError::Msg(format!(
+                "mapped data is missing required column '{need}'. \
+                 Assign a source column for {need} in Field assignment and try again."
+            )));
+        }
+    }
+    Ok(lf)
+}
+
+#[cfg(test)]
+mod plotid_concat_tests {
+    use super::*;
+
+    fn tiny_df() -> DataFrame {
+        df!(
+            "Ecozona" => &["A", "A"],
+            "Eco_plot" => &["P1", "P1"],
+            "tree_num" => &["1", "2"],
+            "YR" => &[2020u32, 2020],
+            "DBH" => &[10.0f64, 12.0],
+            "Species" => &["sp1", "sp2"],
+        )
+        .unwrap()
+    }
+
+    fn collect_mapped(lf: LazyFrame) -> Result<DataFrame, PolarsError> {
+        prepare_mapped_frame(lf, CensusType::Single).collect()
+    }
+
+    /// Concat PlotID from Eco_plot alone (plus TreeID/YR renames) should succeed.
+    #[test]
+    fn concat_plotid_from_eco_plot_only_ok() {
+        let exprs = vec![
+            FieldExpr::Concat {
+                sources: vec!["Eco_plot".into()],
+                sep: "_".into(),
+                target_col: "PlotID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "tree_num".into(),
+                target_col: "TreeID".into(),
+            },
+            FieldExpr::Column {
+                source: "YR".into(),
+                target_col: "YR".into(),
+            },
+        ];
+        let lf = apply_field_exprs(tiny_df().lazy(), &exprs, "in_test")
+            .expect("apply_field_exprs");
+        let out = collect_mapped(lf).expect("Eco_plot-only PlotID concat should collect");
+        assert!(out.column("PlotID").is_ok());
+        assert_eq!(out.column("PlotID").unwrap().str().unwrap().get(0), Some("p1"));
+    }
+
+    /// Production bug shape: sources=["Eco_plot","PlotID"] for target PlotID.
+    /// Self-ref is stripped so mapping still succeeds from Eco_plot alone.
+    #[test]
+    fn concat_plotid_strips_self_ref_source() {
+        let exprs = vec![
+            FieldExpr::Concat {
+                sources: vec!["Eco_plot".into(), "PlotID".into()],
+                sep: "_".into(),
+                target_col: "PlotID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "tree_num".into(),
+                target_col: "TreeID".into(),
+            },
+            FieldExpr::YearFromColumn {
+                source: "YR".into(),
+                target_col: "YR".into(),
+            },
+            FieldExpr::Column {
+                source: "DBH".into(),
+                target_col: "DBH".into(),
+            },
+            FieldExpr::Column {
+                source: "Species".into(),
+                target_col: "Species".into(),
+            },
+        ];
+        let lf = apply_field_exprs(tiny_df().lazy(), &exprs, "in_arg_sosa_2026_s")
+            .expect("self-ref PlotID source should be stripped");
+        let out = collect_mapped(lf).expect("collect after strip");
+        assert_eq!(out.column("PlotID").unwrap().str().unwrap().get(0), Some("p1"));
+    }
+
+    /// A truly missing non-self source still fails (guard does not hide typos).
+    #[test]
+    fn concat_plotid_missing_other_source_still_fails() {
+        let exprs = vec![
+            FieldExpr::Concat {
+                sources: vec!["Eco_plot".into(), "NoSuchCol".into()],
+                sep: "_".into(),
+                target_col: "PlotID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "tree_num".into(),
+                target_col: "TreeID".into(),
+            },
+        ];
+        let err = match apply_field_exprs(tiny_df().lazy(), &exprs, "in_test") {
+            Ok(_) => panic!("missing source must still fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("NoSuchCol") || err.to_string().to_lowercase().contains("not found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Single-source concat must not invent a PlotID self-reference in the plan.
+    #[test]
+    fn concat_plotid_eco_plot_only_plan_has_no_plotid_source() {
+        let exprs = vec![
+            FieldExpr::Concat {
+                sources: vec!["Eco_plot".into()],
+                sep: "_".into(),
+                target_col: "PlotID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "tree_num".into(),
+                target_col: "TreeID".into(),
+            },
+            FieldExpr::Column {
+                source: "YR".into(),
+                target_col: "YR".into(),
+            },
+        ];
+        let lf = apply_field_exprs(tiny_df().lazy(), &exprs, "in_test").expect("apply");
+        let plan = format!("{:?}", lf.explain(false).unwrap_or_default());
+        assert!(
+            !plan.contains("concat_horizontal([col(\"PlotID\")])")
+                && !plan.contains("concat_horizontal([col(\"PlotID\")"),
+            "single-source PlotID concat must not reference PlotID as a source: {plan}"
+        );
+        collect_mapped(lf).expect("Eco_plot-only concat should succeed");
+    }
+
+    /// Rename Eco_plot→PlotID then Concat TreeID from [PlotID, tree_num].
+    /// If Polars reorders rename vs with_columns, this fails with PlotID not found.
+    #[test]
+    fn rename_plotid_then_treeid_concat_using_plotid() {
+        let exprs = vec![
+            FieldExpr::Column {
+                source: "Eco_plot".into(),
+                target_col: "PlotID".into(),
+            },
+            FieldExpr::Concat {
+                sources: vec!["PlotID".into(), "tree_num".into()],
+                sep: "_".into(),
+                target_col: "TreeID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "YR".into(),
+                target_col: "YR".into(),
+            },
+        ];
+        let lf = apply_field_exprs(tiny_df().lazy(), &exprs, "in_test").expect("apply");
+        match collect_mapped(lf) {
+            Ok(out) => {
+                let tree = out.column("TreeID").unwrap().str().unwrap().get(0).unwrap();
+                assert_eq!(tree, "p1_1");
+            }
+            Err(e) => {
+                panic!(
+                    "rename→TreeID concat failed (possible LazyFrame reorder bug): {e}"
+                );
+            }
+        }
+    }
+
+    /// Same dependency via Concat PlotID (not rename) then TreeID concat on PlotID.
+    #[test]
+    fn concat_plotid_then_treeid_concat_using_plotid() {
+        let exprs = vec![
+            FieldExpr::Concat {
+                sources: vec!["Eco_plot".into()],
+                sep: "_".into(),
+                target_col: "PlotID".into(),
+                to_lower: true,
+                prefix: Some("site".into()),
+            },
+            FieldExpr::Concat {
+                sources: vec!["PlotID".into(), "tree_num".into()],
+                sep: "_".into(),
+                target_col: "TreeID".into(),
+                to_lower: true,
+                prefix: None,
+            },
+            FieldExpr::Column {
+                source: "YR".into(),
+                target_col: "YR".into(),
+            },
+        ];
+        let lf = apply_field_exprs(tiny_df().lazy(), &exprs, "in_test").expect("apply");
+        match collect_mapped(lf) {
+            Ok(out) => {
+                let plot = out.column("PlotID").unwrap().str().unwrap().get(0).unwrap();
+                let tree = out.column("TreeID").unwrap().str().unwrap().get(0).unwrap();
+                assert_eq!(plot, "site_p1");
+                assert_eq!(tree, "site_p1_1");
+            }
+            Err(e) => {
+                panic!(
+                    "Concat PlotID→TreeID concat failed (possible with_columns fusion): {e}"
+                );
+            }
+        }
+    }
 }

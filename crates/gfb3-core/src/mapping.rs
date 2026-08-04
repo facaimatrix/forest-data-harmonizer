@@ -55,6 +55,14 @@ pub struct DatasetMetadata {
     pub country: Option<String>,
     pub site: Option<String>,
     pub pi: Option<String>,
+    /// Principal investigator email (optional).
+    #[serde(default)]
+    pub pi_email: Option<String>,
+    /// Contributor / data contact display name.
+    #[serde(default)]
+    pub contact: Option<String>,
+    #[serde(default)]
+    pub contact_email: Option<String>,
     pub dbh_unit: Option<DbhUnit>,
     pub coordinate_crs: Option<String>,
     pub census_years: Vec<u32>,
@@ -89,39 +97,183 @@ impl ContributorMapping {
 
     /// Fuzzy-suggest column mappings from source headers.
     ///
-    /// Uses simple normalised-string similarity — the contributor confirms or
-    /// corrects in the UI.  Not a commitment, just a starting point.
+    /// Exact / strong aliases win over weak substring matches so a real
+    /// `TreeID` column is not stolen by something like `subplot_id` via `"id"`.
     pub fn suggest_from_headers(headers: &[String]) -> Vec<ColumnMapping> {
-        let known: &[(&str, Gfb3Field, &[&str])] = &[
-            ("PlotID", Gfb3Field::PlotId, &["plot", "plotid", "plot_id", "site"]),
-            ("TreeID", Gfb3Field::TreeId, &["tree", "treeid", "tree_id", "individual", "id"]),
-            ("YR",     Gfb3Field::Yr,     &["yr", "year", "census_year", "survey_year"]),
-            ("PrevYR", Gfb3Field::PrevYr, &["prevyr", "prev_yr", "previous_year", "prev_year"]),
-            ("Status", Gfb3Field::Status, &["status", "condition", "state", "fate"]),
-            ("DBH",    Gfb3Field::Dbh,    &["dbh", "diameter", "diam", "d130", "d_bh"]),
-            ("Species",Gfb3Field::Species,&["species", "sp", "taxon", "spp", "scientific"]),
+        // exact: normalized header equality
+        // strong: normalized header contains alias (prefer longer tokens)
+        // weak: last-resort contains (short / ambiguous tokens)
+        let rules: &[(Gfb3Field, &[&str], &[&str], &[&str])] = &[
+            (
+                Gfb3Field::PlotId,
+                &["plotid", "plot_id"],
+                &["plot"],
+                &["site"],
+            ),
+            (
+                Gfb3Field::TreeId,
+                &["treeid", "tree_id"],
+                &["tree", "individual"],
+                &[], // never use bare "id" — matches subplot_id, register_unit_id, etc.
+            ),
+            (
+                Gfb3Field::Yr,
+                &["yr", "year"],
+                &["census_year", "survey_year", "measurement_date", "survey_date", "fecha_censo"],
+                &["date", "fecha", "datetime"],
+            ),
+            (
+                Gfb3Field::PrevYr,
+                &["prevyr", "prev_yr", "previous_year", "prev_year"],
+                &[],
+                &[],
+            ),
+            (
+                Gfb3Field::Status,
+                &["status"],
+                &["condition", "fate"],
+                &["state"],
+            ),
+            (
+                Gfb3Field::Dbh,
+                &["dbh", "d130", "d_bh"],
+                &["diameter", "diam"],
+                &[],
+            ),
+            (
+                Gfb3Field::Species,
+                &["species", "taxon", "spp"],
+                &["scientific"],
+                &["sp"],
+            ),
         ];
+
+        let norms: Vec<(String, String)> = headers
+            .iter()
+            .map(|h| {
+                (
+                    h.clone(),
+                    h.to_lowercase().replace([' ', '-'], "_"),
+                )
+            })
+            .collect();
 
         let mut suggestions = Vec::new();
         let mut used_targets = std::collections::HashSet::new();
+        let mut used_sources = std::collections::HashSet::new();
 
-        'outer: for header in headers {
-            let norm = header.to_lowercase().replace([' ', '-'], "_");
-            for (_, field, aliases) in known {
-                if used_targets.contains(field) {
+        // Pass 1 — exact canonical / strong names
+        for (orig, norm) in &norms {
+            for (field, exact, _, _) in rules {
+                if used_targets.contains(field) || used_sources.contains(orig) {
                     continue;
                 }
-                if aliases.iter().any(|a| norm.contains(a)) {
+                if exact.iter().any(|a| norm == *a) {
                     suggestions.push(ColumnMapping {
-                        source_column: header.clone(),
+                        source_column: orig.clone(),
                         target_field: *field,
                     });
                     used_targets.insert(*field);
-                    continue 'outer;
+                    used_sources.insert(orig.clone());
                 }
             }
         }
+
+        // Pass 2 — strong substring aliases (longest alias first per field)
+        for (orig, norm) in &norms {
+            if used_sources.contains(orig) {
+                continue;
+            }
+            for (field, _, strong, _) in rules {
+                if used_targets.contains(field) {
+                    continue;
+                }
+                let mut aliases: Vec<&&str> = strong.iter().collect();
+                aliases.sort_by_key(|a| std::cmp::Reverse(a.len()));
+                if aliases.iter().any(|a| norm.contains(**a)) {
+                    suggestions.push(ColumnMapping {
+                        source_column: orig.clone(),
+                        target_field: *field,
+                    });
+                    used_targets.insert(*field);
+                    used_sources.insert(orig.clone());
+                }
+            }
+        }
+
+        // Pass 3 — weak aliases
+        for (orig, norm) in &norms {
+            if used_sources.contains(orig) {
+                continue;
+            }
+            for (field, _, _, weak) in rules {
+                if used_targets.contains(field) || weak.is_empty() {
+                    continue;
+                }
+                if weak.iter().any(|a| norm.contains(*a)) {
+                    suggestions.push(ColumnMapping {
+                        source_column: orig.clone(),
+                        target_field: *field,
+                    });
+                    used_targets.insert(*field);
+                    used_sources.insert(orig.clone());
+                }
+            }
+        }
+
         suggestions
+    }
+
+    /// Suggest plot metadata columns (Latitude / Longitude / PA) by exact header match.
+    /// Short names like "lat" / "pa" use equality, not substring, to avoid false hits.
+    pub fn suggest_plot_meta_from_headers(headers: &[String]) -> Vec<(String, String)> {
+        let rules: &[(&str, &[&str])] = &[
+            (
+                "Latitude",
+                &[
+                    "lat",
+                    "latitude",
+                    "latitud",
+                    "y_lat",
+                    "coord_y",
+                    "coords_y",
+                ],
+            ),
+            (
+                "Longitude",
+                &[
+                    "lon",
+                    "long",
+                    "longitude",
+                    "longitud",
+                    "lng",
+                    "x_lon",
+                    "x_long",
+                    "coord_x",
+                    "coords_x",
+                ],
+            ),
+            ("PA", &["pa", "plot_area", "plotarea", "area_ha", "plot_ha"]),
+        ];
+        let mut out = Vec::new();
+        let mut used_targets = std::collections::HashSet::new();
+        let mut used_sources = std::collections::HashSet::new();
+
+        for header in headers {
+            let norm = header.to_lowercase().replace([' ', '-'], "_");
+            for (target, aliases) in rules {
+                if used_targets.contains(target) || used_sources.contains(header.as_str()) {
+                    continue;
+                }
+                if aliases.iter().any(|a| norm == *a) {
+                    out.push((header.clone(), (*target).to_string()));
+                    used_targets.insert(*target);
+                    used_sources.insert(header.as_str());
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Apply the status remapping to a HashMap of (source_value → count),
@@ -143,4 +295,32 @@ pub struct RemapSummaryRow {
     pub source_value: String,
     pub target_code: String,
     pub row_count: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn treeid_exact_wins_over_subplot_id() {
+        let headers = vec![
+            "subplot_subplot_id".into(),
+            "TreeID".into(),
+            "PlotID".into(),
+            "DBH".into(),
+        ];
+        let s = ContributorMapping::suggest_from_headers(&headers);
+        let tree = s.iter().find(|m| m.target_field == Gfb3Field::TreeId).unwrap();
+        assert_eq!(tree.source_column, "TreeID");
+        let plot = s.iter().find(|m| m.target_field == Gfb3Field::PlotId).unwrap();
+        assert_eq!(plot.source_column, "PlotID");
+    }
+
+    #[test]
+    fn treeid_case_insensitive_exact() {
+        let headers = vec!["tree_id".into(), "register_unit_id".into()];
+        let s = ContributorMapping::suggest_from_headers(&headers);
+        let tree = s.iter().find(|m| m.target_field == Gfb3Field::TreeId).unwrap();
+        assert_eq!(tree.source_column, "tree_id");
+    }
 }

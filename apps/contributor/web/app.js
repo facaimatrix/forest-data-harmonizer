@@ -21,32 +21,37 @@ const openDialog = async (opts = {}) => {
   if (!dialogApi || typeof dialogApi.open !== 'function') throw new Error('Dialog API not available');
   return dialogApi.open(opts);
 };
+const saveDialog = async (opts = {}) => {
+  if (!dialogApi) await initTauri();
+  if (!dialogApi || typeof dialogApi.save !== 'function') throw new Error('Save dialog not available');
+  return dialogApi.save(opts);
+};
 
 // ── i18n ──────────────────────────────────────────────────────────────────────
 const t = (key, params) => I18n.t(key, params);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const HARMONIZE_STEP_KEYS = ['steps.contact', 'steps.mode', 'steps.load', 'steps.format', 'steps.inventory', 'steps.status', 'steps.validate', 'steps.export'];
-const DIAGNOSE_STEP_KEYS  = ['steps.contact', 'steps.mode', 'steps.load', 'steps.diagnose'];
+const HARMONIZE_STEP_KEYS = ['steps.setup', 'steps.mode', 'steps.format', 'steps.inventory', 'steps.status', 'steps.species', 'steps.validate', 'steps.export'];
+const DIAGNOSE_STEP_KEYS  = ['steps.setup', 'steps.mode', 'steps.diagnose'];
 
-// Harmonize pipeline: Contact → Mode → Load → Format → …
+// Harmonize: Load+Dataset → Mode → Format → Inventory → Status → Species → Validate → Export
 const STEP = {
-  CONTACT: 0,
+  SETUP: 0,   // Load file + contact / dataset metadata (one pane)
   MODE: 1,
-  LOAD: 2,
-  FORMAT: 3,
-  INVENTORY: 4,
-  STATUS: 5,
+  FORMAT: 2,
+  INVENTORY: 3,
+  STATUS: 4,
+  SPECIES: 5,
   VALIDATE: 6,
   EXPORT: 7,
 };
 
 function harmonizeRender() {
-  return [renderStep3, renderStep1, renderStep0, renderStep2, renderStep4, renderStep5, renderStep6, renderStep7][state.step] || renderStep3;
+  return [renderSetup, renderStep1, renderStep2, renderStep4, renderStep5, renderSpeciesStep, renderStep6, renderStep7][state.step] || renderSetup;
 }
 
 function diagnoseRender() {
-  return [renderStep3, renderStep1, renderStep0, renderDiagnoseStep2][state.step] || renderStep3;
+  return [renderSetup, renderStep1, renderDiagnoseStep2][state.step] || renderSetup;
 }
 
 // ISO 3166-1 country list (name → iso3) — ordered alphabetically by name
@@ -109,7 +114,8 @@ const COUNTRIES = [
 // GFB3 field definitions used in the Column Inventory step
 const GFB3_FIELDS_INFO = [
   { role: 'plot_id',   label: 'PlotID',    type: 'text',    multi: true,  required: true,  desc: 'Unique identifier for each plot. All trees in the same plot share this ID. Must be consistent across censuses. Can be built from multiple columns (e.g. site + plot number).' },
-  { role: 'pa',        label: 'PA',        type: 'number',  multi: false, required: false, desc: 'Plot area in hectares (e.g. 1.0). Used for per-hectare stem-density calculations. Can be a constant if all plots are the same size.' },
+  { role: 'pa',        label: 'PA',        type: 'number',  multi: false, required: false, desc: 'Plot area in hectares (e.g. 1.0). Used for per-hectare density and, for fixed-area plots, to compute EXPAN = 1/PA. Can be a constant if all plots are the same size.' },
+  { role: 'expan',     label: 'EXPAN',     type: 'number',  multi: false, required: false, desc: 'Expansion factor: trees per hectare represented by one measured tree. For fixed-area plots EXPAN = 1/PA. For other designs, enter a constant or leave blank to fill later. Not the same as plot-level TPH (which is n/PA or the sum of EXPAN).' },
   { role: 'latitude',  label: 'Latitude',  type: 'number',  multi: false, required: false, desc: 'Plot centroid latitude in decimal degrees (WGS 84). Negative = south. Can be a constant if all plots share a centroid.' },
   { role: 'longitude', label: 'Longitude', type: 'number',  multi: false, required: false, desc: 'Plot centroid longitude in decimal degrees (WGS 84). Negative = west.' },
   { role: 'tree_id',   label: 'TreeID',    type: 'text',    multi: true,  required: true,  desc: 'Persistent identifier linking the same physical tree across census years. Must be unique within a plot. Can be built from multiple columns (e.g. plot + tag number).' },
@@ -124,6 +130,7 @@ const ROLE_LABELS = {
   plot_id:   'PlotID',
   tree_id:   'TreeID',
   pa:        'PA (plot area)',
+  expan:     'EXPAN (expansion factor)',
   latitude:  'Latitude',
   longitude: 'Longitude',
   species:   'Species',
@@ -142,7 +149,7 @@ const state = {
   dataFormat: null,   // 'long' | 'wide'
 
   // Contact & dataset (step 3)
-  contact: { firstName: '', middleName: '', lastName: '' },
+  contact: { firstName: '', middleName: '', lastName: '', email: '' },
   countryName: '',    // full name, ISO3 derived from COUNTRIES lookup
   country:     '',    // ISO3 (derived)
   submitYear:  new Date().getFullYear(),
@@ -150,8 +157,15 @@ const state = {
   gfb3Dsn:   '',
   siteName:  '',
   piName:    '',
+  piEmail:   '',
+  piSameAsContact: false,
+  curatorName: '',
   dbhUnit:   'cm',
   censusYears: [],
+  // Expansion factor (EXPAN) — tree-level weight
+  fixedArea: true,          // default Yes
+  expanMode: 'later',       // when !fixedArea: 'constant' | 'later'
+  constantExpan: '',
 
   // Field assignments (step 4 — long format)
   fa: {
@@ -189,12 +203,45 @@ const state = {
   statusMode:   'derive', // 'derive' | 'column'
   disappearedTreatment: 'dead',
   deriveResult: null,
+  statusRemaps: {},      // source label → GFB3 code
+  statusVocab: null,     // rows from get_status_vocab
+  statusVocabCol: null,  // column vocab was loaded for
+  statusVocabLoading: false,
+  statusColOverride: '',
+
+  // Species / TNRS
+  speciesResults: null,
+  speciesResolutions: {}, // original → resolved
+  speciesMessage: null,
+  speciesSkipped: false,
+
+  // Export options
+  keepAliveOnly: true,
+  saveInSourceFolder: false,
+  exportOutDir: '',
 
   // Wide format (kept from original)
   columnMappings: [],
   widePairs: [],
   applyResult: null,
   validationReport: null,
+  diagnosticReport: null,
+
+  // Free-access Map workspace (not tied to wizard nav)
+  workspaceView: 'workflow', // 'workflow' | 'map'
+  mapView: {
+    latCol: '',
+    lonCol: '',
+    labelCol: '',
+    symbolCol: '',
+    crs: 'EPSG:4326',
+    utmZone: '18',
+    points: [],
+    truncated: false,
+    status: '',
+    autoTried: false,
+    autoPlotted: false,
+  },
 };
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -203,6 +250,15 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = String(s);
   return d.innerHTML;
+}
+function dirnameOf(path) {
+  if (!path) return '';
+  const trimmed = String(path).replace(/[/\\]+$/, '');
+  const i = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return i < 0 ? '' : trimmed.slice(0, i);
+}
+function sourceFileDir() {
+  return dirnameOf(state.filePath);
 }
 const el   = (id, fn) => { const e = document.getElementById(id); if (e) fn(e); };
 const qsa  = (sel, fn) => document.querySelectorAll(sel).forEach(fn);
@@ -218,6 +274,91 @@ function showError(msg) { const b = document.getElementById('error-bar'); b.text
 function clearError() { document.getElementById('error-bar').classList.remove('visible'); }
 
 function cols() { return state.loadResult ? state.loadResult.columns : []; }
+function usableCols() {
+  return cols().filter(c => c && String(c).trim() && !String(c).startsWith('_unnamed_'));
+}
+
+function freshFa() {
+  return {
+    plotId:  { cols: [], prefix: '' },
+    treeId:  { cols: [] },
+    pa:      { col: '', literal: '' },
+    lat:     { col: '', literal: '' },
+    lon:     { col: '', literal: '' },
+    species: { col: '' },
+    dbh:     { col: '' },
+    yr:      { col: '' },
+    status:  { col: '' },
+  };
+}
+
+/** Keep only source columns that still exist in the loaded file. */
+function pruneFaToColumns(columns) {
+  const set = new Set(columns || []);
+  state.fa.plotId.cols = state.fa.plotId.cols.filter(c => set.has(c));
+  state.fa.treeId.cols = state.fa.treeId.cols.filter(c => set.has(c));
+  for (const key of ['pa', 'lat', 'lon', 'species', 'dbh', 'yr', 'status']) {
+    if (state.fa[key].col && !set.has(state.fa[key].col)) state.fa[key].col = '';
+  }
+}
+
+function contactDisplayName() {
+  return [state.contact.firstName, state.contact.middleName, state.contact.lastName]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function syncPiFromContact() {
+  if (!state.piSameAsContact) return;
+  state.piName = contactDisplayName();
+  state.piEmail = state.contact.email || '';
+  const piEl = document.getElementById('f-pi');
+  const emEl = document.getElementById('f-pi-email');
+  if (piEl) piEl.value = state.piName;
+  if (emEl) emEl.value = state.piEmail;
+}
+
+function buildMetadataPayload() {
+  return {
+    country:        state.country  || null,
+    site:           state.siteName || null,
+    pi:             state.piName   || null,
+    pi_email:       state.piEmail  || null,
+    contact:        contactDisplayName() || null,
+    contact_email:  state.contact.email || null,
+    dbh_unit:       state.dbhUnit,
+    census_years:   state.censusYears,
+    census_type:    state.censusType,
+  };
+}
+
+/** Prefer exact GFB3-like header names when fuzzy suggestion missed them. */
+function seedExactCanonicalCols(columns) {
+  const list = columns || [];
+  const norm = c => String(c).toLowerCase().replace(/[\s-]+/g, '_');
+  const findExact = (aliases) => list.find(c => aliases.includes(norm(c)));
+  if (!state.fa.treeId.cols.length) {
+    const hit = findExact(['treeid', 'tree_id']);
+    if (hit) state.fa.treeId.cols = [hit];
+  }
+  if (!state.fa.plotId.cols.length) {
+    const hit = findExact(['plotid', 'plot_id']);
+    if (hit) state.fa.plotId.cols = [hit];
+  }
+  if (!state.fa.lat.col) {
+    const hit = findExact(['lat', 'latitude', 'latitud', 'y_lat', 'coord_y', 'coords_y']);
+    if (hit) state.fa.lat.col = hit;
+  }
+  if (!state.fa.lon.col) {
+    const hit = findExact(['lon', 'long', 'longitude', 'longitud', 'lng', 'x_lon', 'x_long', 'coord_x', 'coords_x']);
+    if (hit) state.fa.lon.col = hit;
+  }
+  if (!state.fa.pa.col) {
+    const hit = findExact(['pa', 'plot_area', 'plotarea', 'area_ha', 'plot_ha']);
+    if (hit) state.fa.pa.col = hit;
+  }
+}
 
 function sampleVals(col) {
   const lr = state.loadResult;
@@ -256,8 +397,8 @@ function renderStepIndicator() {
   }).join('');
 }
 
-// ── Step 0: Load ───────────────────────────────────────────────────────────────
-function renderStep0() {
+// ── Step 0: Load file + Contact / Dataset metadata ─────────────────────────────
+function renderSetup() {
   const lr = state.loadResult;
   const gate = lr && lr.gate_errors.length
     ? `<div class="gate-errors"><h3>${t('step0.gateTitle')}</h3><ul>${lr.gate_errors.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>`
@@ -272,12 +413,105 @@ function renderStep0() {
       </div>
     </div>` : '';
 
+  const c = state.contact;
+  const dsn = computeDsn();
+  const iso = isoFromCountry(state.countryName).toUpperCase();
+  const countryOpts = COUNTRIES.map(ct =>
+    `<option value="${esc(ct.n)}" ${state.countryName===ct.n?'selected':''}>${esc(I18n.countryName(ct.iso, ct.n))}</option>`
+  ).join('');
+
   return `<div class="step-content">
-    <h2>${t('step0.title')}</h2>
-    <p class="step-desc">${t('step0.desc')}</p>
+    <h2>${t('setup.title')}</h2>
+    <p class="step-desc">${t('setup.desc')}</p>
+
+    <p class="section-heading" style="margin-top:0">${t('step0.title')}</p>
+    <p class="step-desc" style="margin-top:0">${t('step0.desc')}</p>
     <button class="btn btn-primary btn-lg" id="pick-file">${t('step0.pick')}</button>
     ${state.filePath ? `<p class="file-chosen" style="margin-top:.75rem;max-width:600px">${esc(state.filePath)}</p>` : ''}
     ${gate}${preview}
+
+    <p class="section-heading">${t('step3.title')}</p>
+    <p class="step-desc" style="margin-top:0">${t('step3.desc')}</p>
+
+    <p class="section-heading" style="margin-top:1rem;font-size:.85rem">${t('step3.personHeading')}</p>
+    <div class="form-grid" style="max-width:560px">
+      <label>${t('step3.firstName')} <span class="required-mark">*</span></label>
+      <input type="text" id="f-firstname" value="${esc(c.firstName)}" placeholder="${t('step3.phFirst')}" />
+
+      <label>${t('step3.middleName')}</label>
+      <input type="text" id="f-midname" value="${esc(c.middleName)}" placeholder="${t('common.optional')}" />
+
+      <label>${t('step3.lastName')} <span class="required-mark">*</span></label>
+      <input type="text" id="f-lastname" value="${esc(c.lastName)}" placeholder="${t('step3.phLast')}" />
+
+      <label>${t('step3.contactEmail')}</label>
+      <input type="email" id="f-contact-email" value="${esc(c.email)}" placeholder="${t('step3.phEmail')}" />
+
+      <label>${t('step3.curator')} <span class="required-mark">*</span></label>
+      <input type="text" id="f-curator" value="${esc(state.curatorName)}" placeholder="${t('step3.phCurator')}" />
+    </div>
+
+    <p class="section-heading">${t('step3.provenanceHeading')}</p>
+    <div class="form-grid" style="max-width:560px">
+      <label>${t('step3.country')} <span class="required-mark">*</span></label>
+      <div>
+        <select id="f-country" style="min-width:260px;padding:.4rem .6rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.875rem;font-family:inherit;background:var(--surface)">
+          <option value="">${t('common.selectCountry')}</option>
+          ${countryOpts}
+        </select>
+        <span id="country-iso" style="font-family:monospace;font-size:.82rem;color:var(--green-dark);margin-left:.6rem">${iso ? esc(iso) : ''}</span>
+      </div>
+
+      <label>${t('step3.submitYear')} <span class="required-mark">*</span></label>
+      <input type="number" id="f-submityear" value="${esc(state.submitYear)}" min="2000" max="2100" style="width:90px" />
+
+      <label>${t('step3.censusType')} <span class="required-mark">*</span></label>
+      <div>
+        <div class="radio-group">
+          <label style="align-items:flex-start;gap:.4rem">
+            <input type="radio" name="census-type" value="multi"  ${state.censusType==='multi' ?'checked':''} style="margin-top:.2rem" />
+            <span><strong>${t('step3.multiCensus')}</strong> <span style="color:var(--text-muted);font-size:.82rem">${t('step3.multiCensusHint')}</span></span>
+          </label>
+        </div>
+        <div class="radio-group" style="margin-top:.4rem">
+          <label style="align-items:flex-start;gap:.4rem">
+            <input type="radio" name="census-type" value="single" ${state.censusType==='single'?'checked':''} style="margin-top:.2rem" />
+            <span><strong>${t('step3.singleCensus')}</strong> <span style="color:var(--text-muted);font-size:.82rem">${t('step3.singleCensusHint')}</span></span>
+          </label>
+        </div>
+      </div>
+
+      <label>${t('step3.siteName')}</label>
+      <input type="text" id="f-site" value="${esc(state.siteName)}" placeholder="${t('step3.phSite')}" />
+
+      <label>${t('step3.pi')}</label>
+      <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+        <input type="text" id="f-pi" value="${esc(state.piName)}" placeholder="${t('step3.phPi')}"
+          style="flex:1;min-width:10rem" ${state.piSameAsContact ? 'disabled' : ''} />
+        <label style="display:inline-flex;align-items:center;gap:.35rem;font-size:.82rem;color:var(--text-muted);white-space:nowrap;font-weight:400;cursor:pointer">
+          <input type="checkbox" id="f-pi-same" ${state.piSameAsContact ? 'checked' : ''} />
+          ${t('step3.piSameAsContact')}
+        </label>
+      </div>
+
+      <label>${t('step3.piEmail')}</label>
+      <input type="email" id="f-pi-email" value="${esc(state.piEmail)}" placeholder="${t('step3.phEmail')}"
+        ${state.piSameAsContact ? 'disabled' : ''} />
+
+      <label>${t('step3.dbhUnit')}</label>
+      <div class="radio-group">
+        <label><input type="radio" name="dbh-unit" value="cm" ${state.dbhUnit==='cm'?'checked':''} /> cm</label>
+        <label><input type="radio" name="dbh-unit" value="mm" ${state.dbhUnit==='mm'?'checked':''} /> mm <span style="color:var(--text-muted)">${t('step3.mmHint')}</span></label>
+      </div>
+    </div>
+
+    <div style="margin-top:1.25rem;padding:.9rem 1.1rem;background:var(--green-pale);border:1px solid var(--green-light);border-radius:var(--radius);max-width:720px">
+      <div style="font-size:.78rem;color:var(--green-dark);font-weight:600;margin-bottom:.3rem">${t('step3.dsnLabel')}</div>
+      <div style="font-family:monospace;font-size:1.05rem;color:var(--green-dark)" id="dsn-preview">
+        ${dsn ? esc(dsn) : `<span style="color:var(--text-muted);font-style:italic">${t('step3.dsnEmpty')}</span>`}
+      </div>
+      <div style="font-size:.75rem;color:var(--text-muted);margin-top:.3rem">${t('step3.dsnFormat')}</div>
+    </div>
   </div>`;
 }
 
@@ -324,100 +558,21 @@ function renderStep2() {
   </div>`;
 }
 
-// ── Step 3: Contact & Dataset ──────────────────────────────────────────────────
-function renderStep3() {
-  const c = state.contact;
-  const dsn = computeDsn();
-  const iso = isoFromCountry(state.countryName).toUpperCase();
-  const countryOpts = COUNTRIES.map(ct =>
-    `<option value="${esc(ct.n)}" ${state.countryName===ct.n?'selected':''}>${esc(I18n.countryName(ct.iso, ct.n))}</option>`
-  ).join('');
-
-  return `<div class="step-content">
-    <h2>${t('step3.title')}</h2>
-    <p class="step-desc">${t('step3.desc')}</p>
-
-    <p class="section-heading" style="margin-top:0">${t('step3.personHeading')}</p>
-    <div class="form-grid" style="max-width:560px">
-      <label>${t('step3.firstName')} <span class="required-mark">*</span></label>
-      <input type="text" id="f-firstname" value="${esc(c.firstName)}" placeholder="${t('step3.phFirst')}" />
-
-      <label>${t('step3.middleName')}</label>
-      <input type="text" id="f-midname" value="${esc(c.middleName)}" placeholder="${t('common.optional')}" />
-
-      <label>${t('step3.lastName')} <span class="required-mark">*</span></label>
-      <input type="text" id="f-lastname" value="${esc(c.lastName)}" placeholder="${t('step3.phLast')}" />
-    </div>
-
-    <p class="section-heading">${t('step3.provenanceHeading')}</p>
-    <div class="form-grid" style="max-width:560px">
-      <label>${t('step3.country')} <span class="required-mark">*</span></label>
-      <div>
-        <select id="f-country" style="min-width:260px;padding:.4rem .6rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.875rem;font-family:inherit;background:var(--surface)">
-          <option value="">${t('common.selectCountry')}</option>
-          ${countryOpts}
-        </select>
-        ${iso ? `<span style="font-family:monospace;font-size:.82rem;color:var(--green-dark);margin-left:.6rem">${esc(iso)}</span>` : ''}
-      </div>
-
-      <label>${t('step3.submitYear')} <span class="required-mark">*</span></label>
-      <input type="number" id="f-submityear" value="${esc(state.submitYear)}" min="2000" max="2100" style="width:90px" />
-
-      <label>${t('step3.censusType')} <span class="required-mark">*</span></label>
-      <div>
-        <div class="radio-group">
-          <label style="align-items:flex-start;gap:.4rem">
-            <input type="radio" name="census-type" value="multi"  ${state.censusType==='multi' ?'checked':''} style="margin-top:.2rem" />
-            <span><strong>${t('step3.multiCensus')}</strong> <span style="color:var(--text-muted);font-size:.82rem">${t('step3.multiCensusHint')}</span></span>
-          </label>
-        </div>
-        <div class="radio-group" style="margin-top:.4rem">
-          <label style="align-items:flex-start;gap:.4rem">
-            <input type="radio" name="census-type" value="single" ${state.censusType==='single'?'checked':''} style="margin-top:.2rem" />
-            <span><strong>${t('step3.singleCensus')}</strong> <span style="color:var(--text-muted);font-size:.82rem">${t('step3.singleCensusHint')}</span></span>
-          </label>
-        </div>
-      </div>
-
-      <label>${t('step3.siteName')}</label>
-      <input type="text" id="f-site" value="${esc(state.siteName)}" placeholder="${t('step3.phSite')}" />
-
-      <label>${t('step3.pi')}</label>
-      <input type="text" id="f-pi" value="${esc(state.piName)}" placeholder="${t('step3.phPi')}" />
-
-      <label>${t('step3.dbhUnit')}</label>
-      <div class="radio-group">
-        <label><input type="radio" name="dbh-unit" value="cm" ${state.dbhUnit==='cm'?'checked':''} /> cm</label>
-        <label><input type="radio" name="dbh-unit" value="mm" ${state.dbhUnit==='mm'?'checked':''} /> mm <span style="color:var(--text-muted)">${t('step3.mmHint')}</span></label>
-      </div>
-
-    </div>
-
-    <div style="margin-top:1.25rem;padding:.9rem 1.1rem;background:var(--green-pale);border:1px solid var(--green-light);border-radius:var(--radius);max-width:720px">
-      <div style="font-size:.78rem;color:var(--green-dark);font-weight:600;margin-bottom:.3rem">${t('step3.dsnLabel')}</div>
-      <div style="font-family:monospace;font-size:1.05rem;color:var(--green-dark)" id="dsn-preview">
-        ${dsn ? esc(dsn) : `<span style="color:var(--text-muted);font-style:italic">${t('step3.dsnEmpty')}</span>`}
-      </div>
-      <div style="font-size:.75rem;color:var(--text-muted);margin-top:.3rem">${t('step3.dsnFormat')}</div>
-    </div>
-  </div>`;
-}
-
 // ── Step 4 helpers ────────────────────────────────────────────────────────────
 function colSelect(id, value, extra='') {
   const opts = `<option value="">${t('common.none')}</option>` +
-    cols().map(c => `<option value="${esc(c)}" ${value===c?'selected':''}>${esc(c)}</option>`).join('');
+    usableCols().map(c => `<option value="${esc(c)}" ${value===c?'selected':''}>${esc(c)}</option>`).join('');
   return `<select class="fa-sel" id="${id}" style="min-width:200px;padding:.35rem .5rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.83rem;font-family:inherit;background:var(--surface)" ${extra}>${opts}</select>`;
 }
 
 function multiColPills(faKey) {
-  const arr = state.fa[faKey].cols;
-  const available = cols().filter(c => !arr.includes(c));
+  const arr = Array.isArray(state.fa[faKey].cols) ? state.fa[faKey].cols : [];
+  const available = usableCols().filter(c => !arr.includes(c));
   const pills = arr.map((c,i) =>
-    `<span class="fa-pill" data-fakey="${faKey}" data-idx="${i}">${esc(c)}<button class="fa-pill-remove" data-fakey="${faKey}" data-idx="${i}" title="${t('common.remove')}">×</button></span>`
+    `<span class="fa-pill" data-fa-key="${faKey}" data-idx="${i}">${esc(c)}<button type="button" class="fa-pill-remove" data-fa-key="${faKey}" data-idx="${i}" title="${t('common.remove')}">×</button></span>`
   ).join('');
   const addSel = available.length
-    ? `<select class="fa-add-sel" data-fakey="${faKey}" style="padding:.3rem .5rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem;font-family:inherit;background:var(--surface);color:var(--text-muted)">
+    ? `<select class="fa-add-sel" data-fa-key="${faKey}" style="padding:.3rem .5rem;border:1px solid var(--border);border-radius:var(--radius);font-size:.8rem;font-family:inherit;background:var(--surface);color:var(--text-muted)">
         <option value="">${t('common.addColumn')}</option>
         ${available.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')}
        </select>`
@@ -425,9 +580,60 @@ function multiColPills(faKey) {
   return `<div class="fa-pills" style="display:flex;align-items:center;gap:.35rem;flex-wrap:wrap">${pills}${addSel}</div>`;
 }
 
-function concatPreview(cols_, prefix='') {
-  const parts = [...(prefix?[prefix.toLowerCase()]:[]), ...cols_.map(c=>c.toLowerCase())];
-  return parts.length ? parts.join('_') : '…';
+function concatFormula(cols_, prefix = '') {
+  const parts = [...(prefix ? [String(prefix).trim().toLowerCase()] : []), ...cols_.map(c => String(c).toLowerCase())];
+  return parts.filter(Boolean).join('_') || '…';
+}
+
+/**
+ * Build PlotID/TreeID samples the same way as Rust concat (lowercase, "_" join).
+ * Uses the first preview rows in order (not unique-only) so adding a column
+ * visibly changes the samples even when values repeat.
+ */
+function concatSampleValues(cols_, prefix = '', max = 5) {
+  const lr = state.loadResult;
+  if (!lr || (!cols_.length && !(prefix && String(prefix).trim()))) return [];
+  const idxs = cols_.map(c => lr.columns.indexOf(c));
+  // If a selected column is missing from the frame, still show what we can
+  const pfx = prefix && String(prefix).trim() ? String(prefix).trim() : '';
+  const out = [];
+  for (const row of lr.preview_rows) {
+    const parts = [];
+    if (pfx) parts.push(pfx);
+    let anyPresent = false;
+    for (const i of idxs) {
+      if (i < 0) {
+        parts.push('?');
+        continue;
+      }
+      anyPresent = true;
+      const v = row[i];
+      if (v == null || String(v).trim() === '') {
+        // Keep a placeholder so multi-column joins stay visible (a_ / a_b)
+        parts.push('');
+      } else {
+        parts.push(String(v).trim());
+      }
+    }
+    if (!pfx && !anyPresent) continue;
+    // Trim trailing empties from a single trailing null, but keep internal gaps
+    while (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+    const built = parts.join('_').toLowerCase();
+    if (!built) continue;
+    out.push(built);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function concatPreviewHtml(cols_, prefix = '') {
+  const samples = concatSampleValues(cols_, prefix, 5);
+  const formula = concatFormula(cols_, prefix);
+  if (!cols_.length && !(prefix && String(prefix).trim())) return '';
+  const sampleLine = samples.length
+    ? `<div><strong>${samples.map(esc).join('</strong>, <strong>')}</strong></div>`
+    : '';
+  return `→ ${sampleLine}<div class="fa-preview-meta">${esc(formula)}</div>`;
 }
 
 function sampleForCol(c) {
@@ -439,7 +645,7 @@ function sampleForCol(c) {
 function renderPlotMetaSection() {
   const fa = state.fa;
   const pl = state.plotLookup;
-  const allCols = cols();
+  const allCols = usableCols();
   const lookupCols = pl.columns;
 
   const lookupColSel = (id, val, placeholder) => {
@@ -558,18 +764,64 @@ function renderPlotMetaSection() {
     <p style="font-size:.78rem;color:var(--text-muted);margin:.2rem 0 0 1.5rem">${t('fields.lookupHint')}</p>
     ${lookupConfig}
     ${directInputs}
+    <div class="fa-grid" style="margin-top:.6rem">
+      ${renderFixedAreaSection()}
+    </div>
   </div>`;
+}
+
+function renderFixedAreaSection() {
+  const yes = state.fixedArea;
+  const mode = state.expanMode || 'later';
+  return `
+    <div class="fa-row" style="margin-top:1rem;border-top:1px solid var(--border);padding-top:.85rem">
+      <div class="fa-left">
+        <div class="fa-label" style="display:flex;align-items:center;gap:.35rem">
+          ${t('fields.fixedArea')}
+          <button type="button" class="field-help-btn" id="fixed-area-help-btn" aria-label="${esc(t('fields.fixedAreaHelpAria'))}" title="${esc(t('fields.fixedAreaHelpAria'))}">ⓘ</button>
+        </div>
+        <div class="help-tooltip" id="fixed-area-help">${t('fields.fixedAreaHelp')}</div>
+        <div class="fa-desc">${t('fields.fixedAreaDesc')}</div>
+      </div>
+      <div class="fa-right">
+        <div class="radio-group" style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:.55rem">
+          <label style="display:flex;align-items:center;gap:.35rem;cursor:pointer;font-size:.88rem">
+            <input type="radio" name="fixed-area" value="yes" ${yes?'checked':''} /> ${t('common.yes')}
+          </label>
+          <label style="display:flex;align-items:center;gap:.35rem;cursor:pointer;font-size:.88rem">
+            <input type="radio" name="fixed-area" value="no" ${!yes?'checked':''} /> ${t('common.no')}
+          </label>
+        </div>
+        ${yes ? `<p style="font-size:.82rem;color:var(--text-muted);margin:0">${t('fields.expanFixedNote')}</p>` : `
+        <div style="display:flex;flex-direction:column;gap:.55rem">
+          <label style="display:flex;align-items:flex-start;gap:.4rem;cursor:pointer;font-size:.85rem">
+            <input type="radio" name="expan-mode" value="constant" ${mode==='constant'?'checked':''} style="margin-top:.2rem" />
+            <span>
+              ${t('fields.expanEnter')}
+              <input type="number" step="any" min="0" id="fa-expan-lit" class="fa-text-input"
+                value="${esc(state.constantExpan)}" placeholder="${t('fields.phExpan')}"
+                style="width:110px;margin-left:.45rem" ${mode!=='constant'?'disabled':''} />
+            </span>
+          </label>
+          <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;font-size:.85rem">
+            <input type="radio" name="expan-mode" value="later" ${mode==='later'?'checked':''} />
+            ${t('fields.expanLater')}
+          </label>
+          <p style="font-size:.78rem;color:var(--text-muted);margin:0">${t('fields.expanVarNote')}</p>
+        </div>`}
+      </div>
+    </div>`;
 }
 
 function renderStep4() {
   if (state.dataFormat === 'wide') return renderStep4Wide();
 
-  const allCols = cols();
+  const allCols = usableCols();
   if (!allCols.length) return `<div class="step-content"><h2>${t('step4.title')}</h2><p>${t('step4.noColumns')}</p></div>`;
 
   const fa = state.fa;
-  const plotPreview = concatPreview(fa.plotId.cols, fa.plotId.prefix);
-  const treePreview = concatPreview(fa.treeId.cols);
+  const plotPreviewHtml = concatPreviewHtml(fa.plotId.cols, fa.plotId.prefix);
+  const treePreviewHtml = concatPreviewHtml(fa.treeId.cols);
 
   const rows = [
     // ── PlotID ──
@@ -589,7 +841,7 @@ function renderStep4() {
             <span style="color:var(--text-muted);font-size:.78rem">${t('step4.prefixSuffix')}</span>
           </div>
         </div>
-        ${(fa.plotId.cols.length || fa.plotId.prefix) ? `<div class="fa-preview" id="plotid-preview">→ <strong>${esc(plotPreview)}</strong></div>` : `<div class="fa-preview" id="plotid-preview" style="display:none"></div>`}
+        ${(fa.plotId.cols.length || fa.plotId.prefix) ? `<div class="fa-preview" id="plotid-preview">${plotPreviewHtml}</div>` : `<div class="fa-preview" id="plotid-preview" style="display:none"></div>`}
       </div>
     </div>`,
 
@@ -603,7 +855,7 @@ function renderStep4() {
       </div>
       <div class="fa-right">
         ${multiColPills('treeId')}
-        ${fa.treeId.cols.length ? `<div class="fa-preview">→ <strong>${esc(treePreview)}</strong></div>` : ''}
+        ${fa.treeId.cols.length ? `<div class="fa-preview" id="treeid-preview">${treePreviewHtml}</div>` : ''}
       </div>
     </div>`,
 
@@ -674,7 +926,7 @@ function renderStep4Wide() {
 }
 
 function renderStep4WideSub0() {
-  const allCols = cols();
+  const allCols = usableCols();
   const fa = state.fa;
 
   const checkboxes = allCols.map(col => {
@@ -719,7 +971,8 @@ function fieldRowWide(label, faKey, required) {
   const fa = state.fa;
   const isTree = faKey === 'treeId';
   const tip = isTree ? t('wide.treeTip') : t('wide.plotTip');
-  const preview = concatPreview(fa[faKey].cols, faKey === 'plotId' ? fa[faKey].prefix : '');
+  const previewHtml = concatPreviewHtml(fa[faKey].cols, faKey === 'plotId' ? fa[faKey].prefix : '');
+  const previewId = faKey === 'plotId' ? 'plotid-preview' : (faKey === 'treeId' ? 'treeid-preview' : '');
   return `<div class="fa-row">
     <div class="fa-left">
       <div class="fa-label">${label} ${required?'<span class="fa-req">✱</span>':''}</div>
@@ -732,7 +985,9 @@ function fieldRowWide(label, faKey, required) {
           <label class="fa-sublabel">${t('wide.sitePrefix')}</label>
           <input type="text" id="fa-plotid-prefix" class="fa-text-input" value="${esc(fa.plotId.prefix)}" placeholder="${t('step4.phPrefix')}" style="width:120px" />
         </div>` : ''}
-      ${(fa[faKey].cols.length || (faKey === 'plotId' && fa.plotId.prefix)) ? `<div class="fa-preview">→ <strong>${esc(preview)}</strong></div>` : ''}
+      ${(fa[faKey].cols.length || (faKey === 'plotId' && fa.plotId.prefix))
+        ? `<div class="fa-preview"${previewId ? ` id="${previewId}"` : ''}>${previewHtml}</div>`
+        : ''}
     </div>
   </div>`;
 }
@@ -785,25 +1040,28 @@ function renderStep4WideSub1() {
 
 // ── Step 5: Status ─────────────────────────────────────────────────────────────
 function renderStep5() {
+  const mappedCol = state.fa.status.col;
+  // Inventory already chose a Status column → remap only (no re-pick).
+  // Otherwise derive status from census structure.
+  if (mappedCol) {
+    state.statusMode = 'column';
+    if (!state.statusColOverride) state.statusColOverride = mappedCol;
+    return `<div class="step-content">
+      <h2>${t('step5.title')}</h2>
+      <p class="step-desc">${t('step5.remapOnlyDesc', { col: mappedCol })}</p>
+      <div class="field-card" style="margin-top:.75rem">
+        <p style="font-size:.83rem;margin-bottom:.75rem">${t('step5.columnPre')} <strong><code>${esc(mappedCol)}</code></strong></p>
+        ${renderStatusRemapTable()}
+      </div>
+    </div>`;
+  }
+
+  state.statusMode = 'derive';
   const dr = state.deriveResult;
-  const mode = state.statusMode;
-  // Check if the user already assigned a Status column in the inventory
-  const statusCol = cols().find(c => state.colRoles[c] === 'status');
-
-  const tabs = `<div class="field-mode-tabs">
-    <button class="fmode-btn ${mode==='derive'?'active':''}" data-field="status" data-mode="derive">${t('step5.tabDerive')}</button>
-    <button class="fmode-btn ${mode==='column'?'active':''}" data-field="status" data-mode="column">${statusCol ? t('step5.tabColumnNamed', { col: statusCol }) : t('step5.tabColumn')}</button>
-  </div>`;
-
-  let body = '';
-  if (mode === 'column') {
-    const colOpts = `<option value="">${t('common.select')}</option>` + cols().map(c=>`<option value="${esc(c)}" ${(state.statusColOverride||statusCol)===c?'selected':''}>${esc(c)}</option>`).join('');
-    body = `
-      <p style="font-size:.83rem;color:var(--text-muted);margin-bottom:.75rem">${t('step5.columnHint')}</p>
-      ${statusCol ? `<p style="font-size:.83rem;margin-bottom:.5rem">${t('step5.columnPre')} <strong><code>${esc(statusCol)}</code></strong></p>` : ''}
-      <select class="field-col-select" id="fm-status-col">${colOpts}</select>`;
-  } else {
-    body = `
+  return `<div class="step-content">
+    <h2>${t('step5.title')}</h2>
+    <p class="step-desc">${t('step5.desc')}</p>
+    <div class="field-card" style="margin-top:.75rem">
       <div class="info-box" style="margin-bottom:1rem">
         <strong>${t('step5.rulesTitle')}</strong><br>
         • ${t('step5.rule1')}<br>
@@ -813,14 +1071,8 @@ function renderStep5() {
       </div>
       ${dr && dr.summary.disappeared_tree_count > 0 ? renderDisappearedBox() : ''}
       ${dr ? renderDeriveStats(dr) : `<p style="font-size:.83rem;color:var(--text-muted)">${t('step5.clickDerive')}</p>`}
-      <button class="btn btn-primary" id="run-derive-btn" style="margin-top:1rem">${t('step5.deriveBtn')}</button>`;
-  }
-
-  return `<div class="step-content">
-    <h2>${t('step5.title')}</h2>
-    <p class="step-desc">${t('step5.desc')}</p>
-    ${tabs}
-    <div class="field-card" style="margin-top:.75rem">${body}</div>
+      <button class="btn btn-primary" id="run-derive-btn" style="margin-top:1rem">${t('step5.deriveBtn')}</button>
+    </div>
   </div>`;
 }
 
@@ -855,23 +1107,197 @@ function renderDisappearedBox() {
   </div>`;
 }
 
-// ── Step 6: Validation ─────────────────────────────────────────────────────────
+function activeStatusCol() {
+  return state.statusColOverride || state.fa.status.col || cols().find(c => state.colRoles[c] === 'status') || '';
+}
+
+function guessStatusCode(label) {
+  const s = String(label ?? '').trim().toLowerCase();
+  if (/^(0|alive|live|a|v|vivo|viv)$/.test(s)) return '0';
+  if (/^(1|dead|d|died|mort|muerto|m)$/.test(s)) return '1';
+  if (/^(2|recruit|new|ingrowth|recruta|nuevo)$/.test(s)) return '2';
+  if (/^(9|missing|miss|na|n\/a|null|nd|\.)$/.test(s)) return '9';
+  if (/^[0129]$/.test(s)) return s;
+  return '9';
+}
+
+function statusRemapOptions(selected) {
+  return [
+    ['0', t('step5.code0')],
+    ['1', t('step5.code1')],
+    ['2', t('step5.code2')],
+    ['9', t('step5.code9')],
+  ].map(([v, lbl]) => `<option value="${v}" ${selected===v?'selected':''}>${esc(lbl)}</option>`).join('');
+}
+
+function renderStatusRemapTable() {
+  const col = activeStatusCol();
+  if (!col) return '';
+  if (state.statusVocabLoading || state.statusVocabCol !== col) {
+    return `<p style="font-size:.83rem;color:var(--text-muted);margin-top:1rem">${t('step5.remapLoading')}</p>`;
+  }
+  if (!state.statusVocab || !state.statusVocab.length) {
+    return `<p style="font-size:.83rem;color:var(--text-muted);margin-top:1rem">${t('step5.remapEmpty')}</p>`;
+  }
+  const rows = state.statusVocab.map(row => {
+    const cur = state.statusRemaps[row.source_value] ?? row.current_target ?? guessStatusCode(row.source_value);
+    return `<tr>
+      <td><code>${esc(row.source_value)}</code></td>
+      <td style="text-align:right;color:var(--text-muted)">${row.row_count.toLocaleString()}</td>
+      <td><select class="status-remap-sel" data-source="${esc(row.source_value)}">${statusRemapOptions(cur)}</select></td>
+    </tr>`;
+  }).join('');
+  return `
+    <div style="margin-top:1.25rem">
+      <h4 style="font-size:.9rem;margin-bottom:.35rem">${t('step5.remapTitle')}</h4>
+      <p style="font-size:.78rem;color:var(--text-muted);margin-bottom:.6rem">${t('step5.remapDesc')}</p>
+      <table class="preview-table" style="width:100%;font-size:.83rem">
+        <thead><tr><th>${t('step5.remapSource')}</th><th>${t('step5.remapCount')}</th><th>${t('step5.remapTarget')}</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+async function loadStatusVocab(col) {
+  if (!col) {
+    state.statusVocab = null;
+    state.statusVocabCol = null;
+    state.statusVocabLoading = false;
+    return;
+  }
+  if (state.statusVocabLoading && state.statusVocabCol === col) return;
+  state.statusVocabLoading = true;
+  try {
+    const rows = await invoke('get_status_vocab', { column: col });
+    state.statusVocab = Array.isArray(rows) ? rows : [];
+    state.statusVocabCol = col;
+    for (const row of state.statusVocab) {
+      if (state.statusRemaps[row.source_value] == null) {
+        state.statusRemaps[row.source_value] = guessStatusCode(row.source_value);
+      }
+    }
+  } catch (e) {
+    state.statusVocab = [];
+    state.statusVocabCol = col;
+    throw e;
+  } finally {
+    state.statusVocabLoading = false;
+  }
+}
+
+function buildStatusRemaps() {
+  return Object.entries(state.statusRemaps)
+    .filter(([, tgt]) => tgt != null && tgt !== '')
+    .map(([source_value, target_code]) => ({ source_value, target_code, note: null }));
+}
+
+function statusRemapsComplete() {
+  // Already GFB3-coded labels still count; require vocab loaded when using a column
+  if (!activeStatusCol()) return false;
+  if (state.statusVocabLoading || state.statusVocabCol !== activeStatusCol()) return false;
+  if (!state.statusVocab || !state.statusVocab.length) return true; // empty column — allow continue
+  return state.statusVocab.every(row => {
+    const tgt = state.statusRemaps[row.source_value];
+    return tgt != null && tgt !== '';
+  });
+}
+
+// ── Step: Species / TNRS ───────────────────────────────────────────────────────
+function renderSpeciesStep() {
+  const rows = state.speciesResults || [];
+  if (!rows.length && !state.speciesMessage && !state.speciesSkipped) {
+    return `<div class="step-content">
+      <h2>${t('species.title')}</h2>
+      <p class="step-desc">${t('species.desc')}</p>
+      <p style="font-size:.83rem;color:var(--text-muted)">${t('species.clickResolve')}</p>
+      <button class="btn btn-primary" id="run-tnrs-btn" style="margin-top:1rem">${t('species.resolveBtn')}</button>
+    </div>`;
+  }
+  if (state.speciesSkipped) {
+    return `<div class="step-content">
+      <h2>${t('species.title')}</h2>
+      <p class="step-desc">${esc(state.speciesMessage || t('species.skipped'))}</p>
+      <p style="font-size:.83rem;color:var(--text-muted)">${t('species.skipHint')}</p>
+    </div>`;
+  }
+  const needsReview = r => !!(r.ambiguous || (r.near_duplicates && r.near_duplicates.length));
+  const sorted = [...rows].sort((a, b) => Number(needsReview(b)) - Number(needsReview(a)));
+  const reviewCount = sorted.filter(needsReview).length;
+
+  const rowHtml = r => {
+    const amb = needsReview(r);
+    const cur = state.speciesResolutions[r.original] ?? r.best_accepted ?? r.original;
+    const opts = [];
+    opts.push(`<option value="${esc(r.original)}" ${cur===r.original?'selected':''}>${esc(r.original)} ${t('species.keepOriginal')}</option>`);
+    if (r.best_accepted && r.best_accepted !== r.original) {
+      opts.push(`<option value="${esc(r.best_accepted)}" ${cur===r.best_accepted?'selected':''}>${esc(r.best_accepted)} ★</option>`);
+    }
+    (r.matches || []).forEach(m => {
+      const name = m.accepted_name || m.name_matched;
+      if (!name || name === r.original || name === r.best_accepted) return;
+      if (opts.some(o => o.includes(`value="${esc(name)}"`))) return;
+      const score = m.overall_score != null ? ` (${Number(m.overall_score).toFixed(2)})` : '';
+      opts.push(`<option value="${esc(name)}" ${cur===name?'selected':''}>${esc(name)}${score}</option>`);
+    });
+    const near = (r.near_duplicates || []).length
+      ? `<div class="species-near">${t('species.nearDup')}: ${(r.near_duplicates||[]).map(esc).join(', ')}</div>`
+      : '';
+    return `<tr class="${amb?'species-amb':''}">
+      <td><code>${esc(r.original)}</code>${near}</td>
+      <td><select class="species-res-sel" data-original="${esc(r.original)}">${opts.join('')}</select></td>
+      <td>${amb ? `<span class="badge badge-input">${t('species.ambiguous')}</span>` : `<span class="badge badge-clean">${t('species.ok')}</span>`}</td>
+    </tr>`;
+  };
+
+  const reviewRows = sorted.filter(needsReview).map(rowHtml).join('');
+  const okRows = sorted.filter(r => !needsReview(r)).map(rowHtml).join('');
+
+  return `<div class="step-content">
+    <h2>${t('species.title')}</h2>
+    <p class="step-desc">${t('species.desc')}</p>
+    ${state.speciesMessage ? `<div class="info-box" style="margin-bottom:1rem">${esc(state.speciesMessage)}</div>` : ''}
+    <div style="display:flex;gap:.5rem;margin-bottom:1rem;flex-wrap:wrap">
+      <button class="btn btn-ghost" id="run-tnrs-btn">${t('species.resolveBtn')}</button>
+      <button class="btn btn-ghost" id="tnrs-accept-best">${t('species.acceptBest')}</button>
+    </div>
+    ${reviewCount ? `
+      <p class="section-heading" style="margin-top:0">${t('species.reviewHeading', { count: reviewCount })}</p>
+      <table class="preview-table" style="width:100%;font-size:.83rem;margin-bottom:1.5rem">
+        <thead><tr><th>${t('species.colOriginal')}</th><th>${t('species.colResolved')}</th><th>${t('species.colFlag')}</th></tr></thead>
+        <tbody>${reviewRows}</tbody>
+      </table>` : ''}
+    ${okRows ? `
+      <p class="section-heading" style="margin-top:0">${t('species.okHeading')}</p>
+      <table class="preview-table" style="width:100%;font-size:.83rem">
+        <thead><tr><th>${t('species.colOriginal')}</th><th>${t('species.colResolved')}</th><th>${t('species.colFlag')}</th></tr></thead>
+        <tbody>${okRows}</tbody>
+      </table>` : ''}
+  </div>`;
+}
+
+// ── Step 6: Validation + diagnostic report ─────────────────────────────────────
 function renderStep6() {
   const report = state.validationReport;
-  if (!report) return `<div class="step-content"><h2>${t('step6.title')}</h2><p class="step-desc">${t('step6.loading')}</p></div>`;
-  const findings = report.findings;
-  const bySev = sev => findings.filter(f=>f.severity===sev).length;
+  const diag = state.diagnosticReport;
+  if (!report && !diag) {
+    return `<div class="step-content"><h2>${t('step6.title')}</h2><p class="step-desc">${t('step6.loading')}</p></div>`;
+  }
+
+  const findings = report?.findings || [];
+  const bySev = sev => findings.filter(f => f.severity === sev).length;
   const badges = [
-    {sev:'AutoDrop',      label:t('sev.autoDrop'),    cls:'auto'},
-    {sev:'AutoRecode',    label:t('sev.autoRecode'),  cls:'recode'},
-    {sev:'RequiresInput', label:t('sev.needsReview'), cls:'input'},
-    {sev:'Escalate',      label:t('sev.escalate'),     cls:'escalate'},
-  ].filter(b=>bySev(b.sev)>0).map(b=>`<span class="badge badge-${b.cls}">${bySev(b.sev)} ${b.label}</span>`).join('');
+    { sev: 'AutoDrop', label: t('sev.autoDrop'), cls: 'auto' },
+    { sev: 'AutoRecode', label: t('sev.autoRecode'), cls: 'recode' },
+    { sev: 'RequiresInput', label: t('sev.needsReview'), cls: 'input' },
+    { sev: 'Escalate', label: t('sev.escalate'), cls: 'escalate' },
+  ].filter(b => bySev(b.sev) > 0).map(b =>
+    `<span class="badge badge-${b.cls}">${bySev(b.sev)} ${b.label}</span>`
+  ).join('');
 
   const findHtml = findings.length === 0
     ? `<div class="finding finding-clean"><div class="finding-header"><span class="finding-rule">${t('step6.allPassed')}</span><span class="badge badge-clean">${t('step6.clean')}</span></div><p class="finding-message">${t('step6.noIssues')}</p></div>`
     : findings.map(f => {
-        const cls = {AutoDrop:'auto',AutoRecode:'recode',RequiresInput:'input',Escalate:'escalate'}[f.severity]||'recode';
+        const cls = { AutoDrop: 'auto', AutoRecode: 'recode', RequiresInput: 'input', Escalate: 'escalate' }[f.severity] || 'recode';
         return `<div class="finding finding-${cls}">
           <div class="finding-header">
             <span class="finding-rule">${esc(fmtRule(f.rule))}</span>
@@ -883,10 +1309,24 @@ function renderStep6() {
         </div>`;
       }).join('');
 
-  const blockers = findings.some(f=>f.severity==='RequiresInput'||f.severity==='Escalate');
+  const blockers = findings.some(f => f.severity === 'RequiresInput' || f.severity === 'Escalate');
+  const diagHtml = diag?.html
+    ? `<div class="diag-panel">${diag.html}</div>`
+    : '';
+  const exportBtns = diag
+    ? `<div class="diag-export-bar">
+        <button class="btn btn-primary" id="export-diag-pdf">${t('step6.exportPdf')}</button>
+        <button class="btn btn-ghost" id="export-diag-html">${t('step6.exportHtml')}</button>
+      </div>`
+    : '';
+
   return `<div class="step-content">
     <h2>${t('step6.title')}</h2>
     <p class="step-desc">${t('step6.desc')}</p>
+    ${exportBtns}
+    ${diagHtml}
+    <h3 class="section-heading" style="margin-top:1.5rem">${t('step6.integrityHeading')}</h3>
+    <p class="step-desc">${t('step6.integrityDesc')}</p>
     ${badges ? `<div class="findings-summary">${badges}</div>` : ''}
     ${findHtml}
     ${blockers ? `<div class="gate-errors" style="margin-top:1rem"><h3>${t('step6.reviewRequired')}</h3><p style="font-size:.85rem;color:var(--error)">${t('step6.reviewHint')}</p></div>` : ''}
@@ -895,18 +1335,35 @@ function renderStep6() {
 
 // ── Step 7: Export ─────────────────────────────────────────────────────────────
 function renderStep7() {
+  const isSingle = state.censusType === 'single';
   return `<div class="step-content">
     <h2>${t('step7.title')}</h2>
-    <p class="step-desc">${t('step7.desc')}</p>
-    <div class="form-grid" style="max-width:520px;margin-bottom:1rem">
+    <p class="step-desc">${isSingle ? t('step7.descSingle') : t('step7.descMulti')}</p>
+    <div class="info-box" style="margin-bottom:1rem">
+      ${isSingle ? t('step7.gfb2SingleNote') : t('step7.gfb2MultiNote')}
+      <div style="margin-top:.5rem">${t('step7.formatNote')}</div>
+    </div>
+    <label style="display:flex;align-items:flex-start;gap:.5rem;margin-bottom:1rem;font-size:.88rem;cursor:pointer">
+      <input type="checkbox" id="keep-alive-only" ${state.keepAliveOnly?'checked':''} style="margin-top:.2rem" />
+      <span>${t('step7.keepAliveOnly')}</span>
+    </label>
+    <div class="form-grid" style="max-width:640px;margin-bottom:1rem">
       <label>${t('step7.outDir')}</label>
-      <div style="display:flex;gap:.5rem;align-items:center">
-        <input type="text" id="f-outdir" placeholder="${t('step7.phOutDir')}" style="flex:1" readonly />
-        <button class="btn btn-ghost" id="pick-outdir">${t('common.browse')}</button>
+      <div>
+        <input type="text" id="f-outdir" value="${esc(state.exportOutDir)}" placeholder="${t('step7.phOutDir')}" style="width:100%;margin-bottom:.55rem" readonly />
+        <div style="display:flex;gap:.65rem;align-items:center;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:.4rem;font-size:.875rem;cursor:pointer;white-space:nowrap">
+            <input type="checkbox" id="save-in-source-folder" ${state.saveInSourceFolder?'checked':''} ${sourceFileDir()?'':'disabled'} />
+            <span>${t('step7.saveInSourceFolder')}</span>
+          </label>
+          <span style="color:var(--text-muted);font-size:.85rem">${t('common.or')}</span>
+          <button class="btn btn-ghost" id="pick-outdir">${t('common.browse')}</button>
+        </div>
       </div>
       <label>${t('step7.baseName')}</label>
       <input type="text" id="f-basename" value="${esc(state.gfb3Dsn || 'dataset')}" />
     </div>
+    <p class="section-heading" style="margin-top:0">${t('step7.formats')}</p>
     <div class="export-formats">
       <label class="format-card"><input type="checkbox" name="fmt" value="csv"     checked /> CSV</label>
       <label class="format-card"><input type="checkbox" name="fmt" value="parquet" checked /> Parquet</label>
@@ -922,28 +1379,44 @@ function renderStep7() {
 // ── Diagnose mode step 2 ───────────────────────────────────────────────────────
 function renderDiagnoseStep2() {
   const report = state.validationReport;
-  if (!report) return `<div class="step-content"><h2>${t('diagnose.running')}</h2></div>`;
-  const findings = report.findings;
-  const bySev = sev => findings.filter(f=>f.severity===sev).length;
-  const badges = ['AutoDrop','AutoRecode','RequiresInput','Escalate']
-    .filter(s=>bySev(s)>0)
-    .map(s=>{const cls={AutoDrop:'auto',AutoRecode:'recode',RequiresInput:'input',Escalate:'escalate'}[s]; return `<span class="badge badge-${cls}">${bySev(s)} ${fmtSev(s)}</span>`;}).join('');
+  const diag = state.diagnosticReport;
+  if (!report && !diag) return `<div class="step-content"><h2>${t('diagnose.running')}</h2></div>`;
+  const findings = report?.findings || [];
+  const bySev = sev => findings.filter(f => f.severity === sev).length;
+  const badges = ['AutoDrop', 'AutoRecode', 'RequiresInput', 'Escalate']
+    .filter(s => bySev(s) > 0)
+    .map(s => {
+      const cls = { AutoDrop: 'auto', AutoRecode: 'recode', RequiresInput: 'input', Escalate: 'escalate' }[s];
+      return `<span class="badge badge-${cls}">${bySev(s)} ${fmtSev(s)}</span>`;
+    }).join('');
 
   const findHtml = findings.length === 0
     ? `<div class="finding finding-clean"><div class="finding-header"><span class="finding-rule">${t('step6.allPassed')}</span><span class="badge badge-clean">${t('step6.clean')}</span></div><p class="finding-message">${t('diagnose.allPassedMsg')}</p></div>`
-    : findings.map(f=>{const cls={AutoDrop:'auto',AutoRecode:'recode',RequiresInput:'input',Escalate:'escalate'}[f.severity]||'recode';
+    : findings.map(f => {
+        const cls = { AutoDrop: 'auto', AutoRecode: 'recode', RequiresInput: 'input', Escalate: 'escalate' }[f.severity] || 'recode';
         return `<div class="finding finding-${cls}"><div class="finding-header"><span class="finding-rule">${esc(fmtRule(f.rule))}</span><span class="badge badge-${cls}">${esc(fmtSev(f.severity))}</span><span class="finding-count">${t('step6.rowCount', { count: f.row_count.toLocaleString() })}</span></div><p class="finding-message">${esc(f.message)}</p><div class="finding-action">${t('common.action')}: <strong>${esc(fmtAction(f.action))}</strong></div></div>`;
       }).join('');
+
+  const diagHtml = diag?.html ? `<div class="diag-panel">${diag.html}</div>` : '';
+  const exportBtns = diag
+    ? `<div class="diag-export-bar">
+        <button class="btn btn-primary" id="export-diag-pdf">${t('step6.exportPdf')}</button>
+        <button class="btn btn-ghost" id="export-diag-html">${t('step6.exportHtml')}</button>
+      </div>`
+    : '';
 
   return `<div class="step-content">
     <h2>${t('diagnose.title')}</h2>
     <p style="font-size:.83rem;color:var(--text-muted);margin-bottom:1rem">
       ${t('diagnose.fileMeta', {
-        name: esc(state.filePath?(state.filePath.split(/[/\\]/).pop()):''),
-        rows: (state.loadResult?.row_count??0).toLocaleString(),
-        cols: (state.loadResult?.columns??[]).length,
+        name: esc(state.filePath ? (state.filePath.split(/[/\\]/).pop()) : ''),
+        rows: (state.loadResult?.row_count ?? 0).toLocaleString(),
+        cols: (state.loadResult?.columns ?? []).length,
       })}
     </p>
+    ${exportBtns}
+    ${diagHtml}
+    <h3 class="section-heading" style="margin-top:1.5rem">${t('step6.integrityHeading')}</h3>
     ${badges ? `<div class="findings-summary">${badges}</div>` : ''}
     ${findHtml}
   </div>`;
@@ -987,7 +1460,7 @@ function buildCurationLog() {
     `SITE: ${state.siteName}`,
     `PI: ${state.piName}`,
     `CONTRIBUTOR: ${[state.contact.firstName, state.contact.middleName, state.contact.lastName].filter(Boolean).join(' ')}`,
-    `CURATOR: Francisco Rivas`,
+    `CURATOR: ${state.curatorName.trim()}`,
     `DATE RECEIVED: `,
     `DATE PROCESSED: ${new Date().toISOString().slice(0,10)}`,
     `--- SOURCE FORMAT ---`,
@@ -1013,32 +1486,22 @@ function renderNav() {
   let hint = '', nextLabel = t('nav.next'), nextDisabled = false;
 
   const lr = state.loadResult;
+  if (state.step === STEP.SETUP) {
+    if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
+    else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
+    else {
+      const dsn = computeDsn();
+      if (!state.contact.firstName.trim() || !state.contact.lastName.trim()) { hint = t('nav.hint.nameRequired'); nextDisabled = true; }
+      else if (!state.curatorName.trim()) { hint = t('nav.hint.curatorRequired'); nextDisabled = true; }
+      else if (!state.countryName) { hint = t('nav.hint.selectCountry'); nextDisabled = true; }
+      else if (!String(state.submitYear).match(/^\d{4}$/)) { hint = t('nav.hint.submitYear'); nextDisabled = true; }
+      else if (!dsn) { hint = t('nav.hint.completeDsn'); nextDisabled = true; }
+    }
+  }
   if (state.mode === 'diagnose') {
-    if (state.step === STEP.CONTACT) {
-      const dsn = computeDsn();
-      if (!state.contact.firstName.trim() || !state.contact.lastName.trim()) { hint = t('nav.hint.nameRequired'); nextDisabled = true; }
-      else if (!state.countryName) { hint = t('nav.hint.selectCountry'); nextDisabled = true; }
-      else if (!String(state.submitYear).match(/^\d{4}$/)) { hint = t('nav.hint.submitYear'); nextDisabled = true; }
-      else if (!dsn) { hint = t('nav.hint.completeDsn'); nextDisabled = true; }
-    }
     if (state.step === STEP.MODE && !state.mode) { hint = t('nav.hint.chooseMode'); nextDisabled = true; }
-    if (state.step === STEP.LOAD) {
-      if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
-      else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
-    }
   } else {
-    if (state.step === STEP.CONTACT) {
-      const dsn = computeDsn();
-      if (!state.contact.firstName.trim() || !state.contact.lastName.trim()) { hint = t('nav.hint.nameRequired'); nextDisabled = true; }
-      else if (!state.countryName) { hint = t('nav.hint.selectCountry'); nextDisabled = true; }
-      else if (!String(state.submitYear).match(/^\d{4}$/)) { hint = t('nav.hint.submitYear'); nextDisabled = true; }
-      else if (!dsn) { hint = t('nav.hint.completeDsn'); nextDisabled = true; }
-    }
     if (state.step === STEP.MODE && !state.mode) { hint = t('nav.hint.chooseMode'); nextDisabled = true; }
-    if (state.step === STEP.LOAD) {
-      if (!lr) { hint = t('nav.hint.loadFile'); nextDisabled = true; }
-      else if (lr.gate_errors.length) { hint = t('nav.hint.fixStructure'); nextDisabled = true; }
-    }
     if (state.step === STEP.FORMAT && !state.dataFormat) { hint = t('nav.hint.selectFormat'); nextDisabled = true; }
 
     if (state.step === STEP.INVENTORY) {
@@ -1052,7 +1515,12 @@ function renderNav() {
     if (state.step === STEP.STATUS) {
       if (state.statusMode === 'derive' && !state.deriveResult) { hint = t('nav.hint.runDerive'); nextDisabled = true; }
       else if (state.statusMode === 'column' && !statusColSelected()) { hint = t('nav.hint.selectStatusCol'); nextDisabled = true; }
-      else { nextLabel = t('nav.validate'); }
+      else if (state.statusMode === 'column' && !statusRemapsComplete()) { hint = t('nav.hint.mapStatus'); nextDisabled = true; }
+      else { nextLabel = t('nav.next'); }
+    }
+
+    if (state.step === STEP.SPECIES) {
+      nextLabel = t('nav.validate');
     }
 
     if (state.step === STEP.VALIDATE) {
@@ -1063,12 +1531,12 @@ function renderNav() {
   }
 
   const isLastStep = state.step === stepNames().length - 1;
-  if (isLastStep) { nextLabel = t('nav.startOver'); nextDisabled = false; }
+  if (isLastStep) { nextLabel = t('nav.done'); nextDisabled = true; }
 
   return `
     <button class="btn btn-ghost" id="btn-prev" ${canBack?'':'disabled'}>${t('common.back')}</button>
     <span class="nav-hint">${esc(hint)}</span>
-    <button class="btn btn-primary" id="btn-next" ${nextDisabled?'disabled':''}>${esc(nextLabel)}</button>`;
+    ${isLastStep ? '' : `<button class="btn btn-primary" id="btn-next" ${nextDisabled?'disabled':''}>${esc(nextLabel)}</button>`}`;
 }
 
 function inventoryValid() {
@@ -1093,28 +1561,60 @@ function inventoryValid() {
 }
 
 function statusColSelected() {
-  const fromInventory = cols().find(c => state.colRoles[c] === 'status');
-  return !!(state.statusColOverride || fromInventory);
+  return !!activeStatusCol();
 }
 
 // ── Main render ────────────────────────────────────────────────────────────────
 function render() {
-  try { document.getElementById('step-indicator').innerHTML = renderStepIndicator(); } catch(e){}
+  try {
+    document.body.classList.toggle('map-workspace', state.workspaceView === 'map');
+    document.querySelectorAll('.workspace-tab').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.view === state.workspaceView);
+      if (btn.dataset.view === 'workflow') btn.textContent = t('workspace.workflow');
+      if (btn.dataset.view === 'map') btn.textContent = t('workspace.map');
+    });
+  } catch (e) {}
+  try {
+    document.getElementById('step-indicator').innerHTML =
+      state.workspaceView === 'map' ? '' : renderStepIndicator();
+  } catch (e) {}
   try {
     let html = '';
-    if (state.mode === 'diagnose') {
+    if (state.workspaceView === 'map') {
+      maybeAutoSeedMapCols();
+      html = renderMapView();
+    } else if (state.mode === 'diagnose') {
       html = (diagnoseRender() || renderStep1)();
     } else {
-      html = (harmonizeRender() || renderStep3)();
+      html = (harmonizeRender() || renderSetup)();
     }
     document.getElementById('main').innerHTML = html;
   } catch(e) {
     console.error('Render error:', e);
     document.getElementById('main').innerHTML = `<div style="color:red;padding:2rem;font-family:monospace;white-space:pre-wrap">${esc(t('error.render', { msg: e.message }))}\n${esc(e.stack)}</div>`;
   }
-  try { document.getElementById('nav').innerHTML = renderNav(); } catch(e){}
+  try {
+    document.getElementById('nav').innerHTML =
+      state.workspaceView === 'map' ? '' : renderNav();
+  } catch(e){}
   try { attachHandlers(); } catch(e) { console.error('Handler error:', e); }
   I18n.applyStaticLabels();
+  if (state.workspaceView === 'map') {
+    initPlotMapLeaflet();
+    const mv = state.mapView;
+    if (mv.latCol && mv.lonCol && !mv.points.length && !mv.autoPlotted) {
+      mv.autoPlotted = true;
+      loadAndPlotMapPoints();
+    }
+  }
+  if (state.mode === 'harmonize' && state.step === STEP.STATUS && state.fa.status.col) {
+    const col = activeStatusCol();
+    if (col && state.statusVocabCol !== col && !state.statusVocabLoading) {
+      loadStatusVocab(col)
+        .then(() => render())
+        .catch(e => { showError(String(e)); render(); });
+    }
+  }
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────────
@@ -1129,20 +1629,52 @@ function attachHandlers() {
       const result = await invoke('load_file', { path });
       state.filePath = path;
       state.loadResult = result;
+      // New file → clear prior field picks (stale "PlotID" etc. breaks concat mapping)
+      state.fa = freshFa();
+      state.applyResult = null;
+      state.validationReport = null;
+      state.diagnosticReport = null;
+      state.deriveResult = null;
+      state.statusVocab = null;
+      state.statusVocabCol = null;
+      state.speciesResults = null;
+      state.speciesResolutions = {};
       // Seed colRoles from suggestions
       state.colRoles = {};
       for (const s of result.suggested_mappings) {
         if (!s.suggested_gfb3_field) continue;
-        const roleMap = { PlotId:'plot_id', TreeId:'tree_id', Yr:'yr', Dbh:'dbh', Species:'species', Status:'status' };
+        const roleMap = {
+          PlotId: 'plot_id', TreeId: 'tree_id', Yr: 'yr', Dbh: 'dbh',
+          Species: 'species', Status: 'status',
+          Latitude: 'lat', Longitude: 'lon', PA: 'pa',
+        };
         const role = roleMap[s.suggested_gfb3_field];
         if (role) state.colRoles[s.source_column] = role;
+        if (role === 'yr' && !state.fa.yr.col) state.fa.yr.col = s.source_column;
+        if (role === 'status' && !state.fa.status.col) state.fa.status.col = s.source_column;
+        if (role === 'dbh' && !state.fa.dbh.col) state.fa.dbh.col = s.source_column;
+        if (role === 'species' && !state.fa.species.col) state.fa.species.col = s.source_column;
+        if (role === 'plot_id' && !state.fa.plotId.cols.length) state.fa.plotId.cols = [s.source_column];
+        if (role === 'tree_id' && !state.fa.treeId.cols.length) state.fa.treeId.cols = [s.source_column];
+        if (role === 'lat' && !state.fa.lat.col) state.fa.lat.col = s.source_column;
+        if (role === 'lon' && !state.fa.lon.col) state.fa.lon.col = s.source_column;
+        if (role === 'pa' && !state.fa.pa.col) state.fa.pa.col = s.source_column;
       }
+      pruneFaToColumns(result.columns);
+      seedExactCanonicalCols(result.columns);
       state.plotIdOrder = []; state.treeIdOrder = [];
+      state.mapView.autoTried = false;
+      state.mapView.points = [];
+      state.mapView.status = '';
+      state.mapView.autoPlotted = false;
+      // Seed map cols from field assignment / suggestions
+      if (!state.mapView.latCol && state.fa.lat.col) state.mapView.latCol = state.fa.lat.col;
+      if (!state.mapView.lonCol && state.fa.lon.col) state.mapView.lonCol = state.fa.lon.col;
       state.widePairs = result.columns
         .map(c => { const m = c.match(/(\d{4})$/); return m ? { source_column: c, year: parseInt(m[1],10) } : null; })
         .filter(Boolean);
     } catch(e) { showError(String(e)); }
-    finally { hideLoading(); render(); }
+    finally { hideLoading(); collectStep3Dom(); render(); }
   }));
 
   // Step 1
@@ -1154,15 +1686,42 @@ function attachHandlers() {
   el('fmt-wide', e => e.addEventListener('click', () => { state.dataFormat = 'wide'; render(); }));
 
   // Step 3: contact + DSN
-  bind('f-firstname',  v => { state.contact.firstName = v; updateDsnPreview(); });
-  bind('f-midname',    v => { state.contact.middleName = v; });
-  bind('f-lastname',   v => { state.contact.lastName = v; updateDsnPreview(); });
-  bindS('f-country',   v => { state.countryName = v; state.country = isoFromCountry(v).toUpperCase(); updateDsnPreview(); render(); });
+  bind('f-firstname',  v => { state.contact.firstName = v; updateDsnPreview(); syncPiFromContact(); });
+  bind('f-midname',    v => { state.contact.middleName = v; syncPiFromContact(); });
+  bind('f-lastname',   v => { state.contact.lastName = v; updateDsnPreview(); syncPiFromContact(); });
+  bind('f-contact-email', v => { state.contact.email = v; syncPiFromContact(); });
+  bind('f-curator',    v => { state.curatorName = v; refreshNav(); });
+  // Country: update in place — never full-render on change. Native <select>
+  // typeahead fires change on each letter match; re-rendering steals focus
+  // (often onto Next) while the user is still searching.
+  el('f-country', sel => {
+    sel.addEventListener('keydown', e => {
+      if (e.key === 'Enter') e.preventDefault();
+    });
+    sel.addEventListener('change', e => {
+      const v = e.target.value;
+      state.countryName = v;
+      state.country = isoFromCountry(v).toUpperCase();
+      const isoEl = document.getElementById('country-iso');
+      if (isoEl) isoEl.textContent = state.country || '';
+      updateDsnPreview();
+    });
+  });
   bind('f-submityear', v => { state.submitYear = v; updateDsnPreview(); });
   bind('f-site',       v => { state.siteName = v; });
-  bind('f-pi',         v => { state.piName = v; });
+  bind('f-pi',         v => { if (!state.piSameAsContact) state.piName = v; });
+  bind('f-pi-email',   v => { if (!state.piSameAsContact) state.piEmail = v; });
+  el('f-pi-same', chk => chk.addEventListener('change', e => {
+    state.piSameAsContact = !!e.target.checked;
+    if (state.piSameAsContact) syncPiFromContact();
+    render();
+  }));
   qsa('input[name="dbh-unit"]',   r => r.addEventListener('change', e => { state.dbhUnit = e.target.value; }));
-  qsa('input[name="census-type"]',r => r.addEventListener('change', e => { state.censusType = e.target.value; updateDsnPreview(); }));
+  qsa('input[name="census-type"]',r => r.addEventListener('change', e => {
+    state.censusType = e.target.value;
+    if (state.censusType === 'single') state.dataFormat = 'long';
+    updateDsnPreview();
+  }));
 
   // Step 4 long — single-column selectors
   qsa('.fa-sel', sel => sel.addEventListener('change', e => {
@@ -1177,9 +1736,14 @@ function attachHandlers() {
       state.fa.plotId.prefix = e.target.value;
       const prev = document.getElementById('plotid-preview');
       if (prev) {
-        const p = concatPreview(state.fa.plotId.cols, state.fa.plotId.prefix);
-        prev.style.display = '';
-        prev.innerHTML = `→ <strong>${esc(p)}</strong>`;
+        const html = concatPreviewHtml(state.fa.plotId.cols, state.fa.plotId.prefix);
+        if (html) {
+          prev.style.display = '';
+          prev.innerHTML = html;
+        } else {
+          prev.style.display = 'none';
+          prev.innerHTML = '';
+        }
       }
     });
   });
@@ -1222,15 +1786,71 @@ function attachHandlers() {
   bindS('coord-format-sel', v => { state.coordFormat = v; render(); });
   el('open-map-btn', btn => btn.addEventListener('click', openMapModal));
 
+  // Fixed-area / EXPAN
+  qsa('input[name="fixed-area"]', r => r.addEventListener('change', e => {
+    state.fixedArea = e.target.value === 'yes';
+    render();
+  }));
+  qsa('input[name="expan-mode"]', r => r.addEventListener('change', e => {
+    state.expanMode = e.target.value;
+    render();
+  }));
+  bind('fa-expan-lit', v => { state.constantExpan = v; });
+  el('fixed-area-help-btn', btn => btn.addEventListener('click', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    const tip = document.getElementById('fixed-area-help');
+    if (tip) tip.classList.toggle('visible');
+  }));
+
+  // Map workspace toolbar
+  bindS('map-lat-col', v => { state.mapView.latCol = v; });
+  bindS('map-lon-col', v => { state.mapView.lonCol = v; });
+  bindS('map-label-col', v => { state.mapView.labelCol = v; });
+  bindS('map-symbol-col', v => {
+    state.mapView.symbolCol = v;
+    if (state.mapView.points.length && state.mapView.latCol && state.mapView.lonCol) {
+      loadAndPlotMapPoints();
+    } else if (state.mapView.points.length) {
+      drawPlotMapPoints(state.mapView.points);
+    }
+  });
+  bindS('map-crs', v => {
+    state.mapView.crs = v;
+    state.mapView.points = [];
+    state.mapView.autoPlotted = false;
+    state.mapView.status = '';
+    render();
+  });
+  bind('map-utm-zone', v => { state.mapView.utmZone = v; });
+  el('map-plot-btn', btn => btn.addEventListener('click', () => loadAndPlotMapPoints()));
+  el('map-save-html', btn => btn.addEventListener('click', () => savePlotMapHtml()));
+
   // Step 4 — multi-col add/remove (PlotID, TreeID)
   qsa('.fa-add-sel', sel => sel.addEventListener('change', e => {
-    const key = e.target.dataset.fakey, val = e.target.value;
-    if (val && !state.fa[key].cols.includes(val)) { state.fa[key].cols.push(val); }
+    const elSel = e.currentTarget;
+    const key = elSel.dataset.faKey;
+    const val = elSel.value;
+    if (!key || !val || !state.fa[key]) return;
+    // Only block the synthetic target name when it is not a real source column
+    const isRealCol = usableCols().includes(val);
+    if (!isRealCol && key === 'plotId' && val === 'PlotID') return;
+    if (!isRealCol && key === 'treeId' && val === 'TreeID') return;
+    if (!Array.isArray(state.fa[key].cols)) state.fa[key].cols = [];
+    if (!state.fa[key].cols.includes(val)) {
+      state.fa[key].cols = state.fa[key].cols.concat([val]);
+    }
     render();
   }));
   qsa('.fa-pill-remove', btn => btn.addEventListener('click', e => {
-    const key = e.target.dataset.fakey, idx = parseInt(e.target.dataset.idx, 10);
-    state.fa[key].cols.splice(idx, 1);
+    e.preventDefault();
+    e.stopPropagation();
+    const elBtn = e.currentTarget;
+    const key = elBtn.dataset.faKey;
+    const idx = parseInt(elBtn.dataset.idx, 10);
+    if (!key || !state.fa[key] || !Array.isArray(state.fa[key].cols)) return;
+    if (Number.isNaN(idx) || idx < 0 || idx >= state.fa[key].cols.length) return;
+    state.fa[key].cols = state.fa[key].cols.filter((_, i) => i !== idx);
     render();
   }));
 
@@ -1255,12 +1875,11 @@ function attachHandlers() {
     refreshNav();
   }));
 
-  // Step 5: status mode tabs
-  qsa('[data-field="status"][data-mode]', btn => btn.addEventListener('click', () => {
-    state.statusMode = btn.dataset.mode;
-    render();
+  // Step 5: status (derive when no inventory Status; remap when Status was mapped)
+  qsa('.status-remap-sel', sel => sel.addEventListener('change', e => {
+    state.statusRemaps[e.target.dataset.source] = e.target.value;
+    refreshNav();
   }));
-  bindS('fm-status-col', v => { state.statusColOverride = v; refreshNav(); });
   qsa('.treatment-btn', btn => btn.addEventListener('click', async () => {
     state.disappearedTreatment = btn.dataset.treatment;
     render();
@@ -1288,11 +1907,63 @@ function attachHandlers() {
   el('map-modal-confirm', btn => btn.addEventListener('click', confirmMapCoords));
 
   // Export
+  el('save-in-source-folder', cb => cb.addEventListener('change', e => {
+    state.saveInSourceFolder = e.target.checked;
+    if (state.saveInSourceFolder) {
+      const dir = sourceFileDir();
+      if (!dir) {
+        state.saveInSourceFolder = false;
+        e.target.checked = false;
+        showError(t('error.noSourceFolder'));
+        return;
+      }
+      state.exportOutDir = dir;
+    }
+    const out = document.getElementById('f-outdir');
+    if (out) out.value = state.exportOutDir;
+  }));
   el('pick-outdir', btn => btn.addEventListener('click', async () => {
     const dir = await openDialog({ directory: true });
-    if (dir) { const e = document.getElementById('f-outdir'); if (e) e.value = dir; }
+    if (!dir) return;
+    state.exportOutDir = dir;
+    state.saveInSourceFolder = false;
+    const out = document.getElementById('f-outdir');
+    if (out) out.value = dir;
+    const cb = document.getElementById('save-in-source-folder');
+    if (cb) cb.checked = false;
   }));
+  el('keep-alive-only', cb => cb.addEventListener('change', e => { state.keepAliveOnly = e.target.checked; }));
   el('do-export', btn => btn.addEventListener('click', doExport));
+
+  el('export-diag-pdf', btn => btn.addEventListener('click', () => exportDiagnostic('pdf')));
+  el('export-diag-html', btn => btn.addEventListener('click', () => exportDiagnostic('html')));
+
+  // Species / TNRS
+  el('run-tnrs-btn', btn => btn.addEventListener('click', async () => {
+    clearError();
+    showLoading(t('loading.tnrs'));
+    try {
+      const res = await invoke('resolve_species_tnrs');
+      state.speciesResults = res.results || [];
+      state.speciesSkipped = !!res.skipped;
+      state.speciesMessage = res.message || null;
+      state.speciesResolutions = {};
+      for (const r of state.speciesResults) {
+        state.speciesResolutions[r.original] = r.best_accepted || r.original;
+      }
+      render();
+    } catch (e) { showError(String(e)); }
+    finally { hideLoading(); }
+  }));
+  el('tnrs-accept-best', btn => btn.addEventListener('click', () => {
+    for (const r of (state.speciesResults || [])) {
+      if (r.best_accepted) state.speciesResolutions[r.original] = r.best_accepted;
+    }
+    render();
+  }));
+  qsa('.species-res-sel', sel => sel.addEventListener('change', e => {
+    state.speciesResolutions[e.target.dataset.original] = e.target.value;
+  }));
 
   attachNavHandlers();
 }
@@ -1338,11 +2009,14 @@ function attachNavHandlers() {
     if (state.step === STEP.INVENTORY && state.dataFormat === 'wide' && state.wideStep === 1) {
       state.wideStep = 0; clearError(); render(); return;
     }
+    // Single-census skips Format — go Mode ← Inventory
+    if (state.step === STEP.INVENTORY && state.censusType === 'single') {
+      state.step = STEP.MODE; clearError(); render(); return;
+    }
+    // Species ← Status; Validate ← Species
     if (state.step > 0) { state.step--; clearError(); render(); }
   }));
   el('btn-next', btn => btn.addEventListener('click', async () => {
-    // Last step: start over by reloading the page (clears all state cleanly)
-    if (state.step === stepNames().length - 1) { window.location.reload(); return; }
     clearError();
     try { await advanceStep(); } catch(e) { showError(String(e)); }
   }));
@@ -1350,27 +2024,41 @@ function attachNavHandlers() {
 
 // ── Step advance ───────────────────────────────────────────────────────────────
 async function advanceStep() {
-  if (state.step === STEP.CONTACT) collectStep3Dom();
+  if (state.step === STEP.SETUP) collectStep3Dom();
 
-  // Diagnose: after Load → validate → results
-  if (state.mode === 'diagnose' && state.step === STEP.LOAD) {
+  // Diagnose: after Mode → validate → results
+  if (state.mode === 'diagnose' && state.step === STEP.MODE) {
     showLoading(t('loading.integrity'));
     try {
       await invoke('use_raw_as_gfb3');
-      state.validationReport = await invoke('run_validation');
+      const result = await invoke('run_validation');
+      state.validationReport = result.validation ?? result;
+      state.diagnosticReport = result.diagnostic ?? null;
       state.step = DIAGNOSE_STEP_KEYS.length - 1; render();
     } finally { hideLoading(); }
     return;
   }
 
-  // Harmonize only from here
   if (state.mode === 'diagnose') {
     if (state.step < stepNames().length - 1) { state.step++; render(); }
     return;
   }
 
+  // Single-census: skip Format (always long)
+  if (state.step === STEP.MODE) {
+    if (state.censusType === 'single') {
+      state.dataFormat = 'long';
+      state.step = STEP.INVENTORY;
+      render();
+      return;
+    }
+  }
+
+  // After Format for multi, or when leaving Format
+  // (handled by default increment)
+
   // Harmonize inventory wide sub-step 0 → 1
-  if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'wide' && state.wideStep === 0) {
+  if (state.step === STEP.INVENTORY && state.dataFormat === 'wide' && state.wideStep === 0) {
     state.wideStep = 1;
     render();
     return;
@@ -1378,31 +2066,51 @@ async function advanceStep() {
 
   // Harmonize inventory (long): apply field mapping
   if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'long') {
+    // Drop stale picks that are not in the loaded file
+    pruneFaToColumns(cols());
+    const fields = buildFieldExprs();
+    if (!fields.some(f => f.target_col === 'PlotID')) {
+      showError(t('nav.reason.plotId'));
+      return;
+    }
+    if (!fields.some(f => f.target_col === 'TreeID')) {
+      showError(t('nav.reason.treeId'));
+      return;
+    }
+    if (!fields.some(f => f.target_col === 'YR')) {
+      showError(t('nav.reason.yr'));
+      return;
+    }
     showLoading(t('loading.mapping'));
     try {
-      const fields = buildFieldExprs();
       state.applyResult = await invoke('apply_fields_mapping', {
         request: {
           gfb3_dsn: state.gfb3Dsn,
           fields,
           dbh_unit: state.dbhUnit,
           status_remaps: [],
-          metadata: {
-            country:      state.country  || null,
-            site:         state.siteName || null,
-            pi:           state.piName   || null,
-            dbh_unit:     state.dbhUnit,
-            census_years: state.censusYears,
-            census_type:  state.censusType,
-          },
+          metadata: buildMetadataPayload(),
         },
       });
       state.deriveResult = null;
-      // For single-census data, skip the Status step (no PrevYR/PrevDBH needed)
-      state.step = state.censusType === 'single' ? STEP.VALIDATE : STEP.STATUS;
-      if (state.censusType === 'single') {
-        showLoading(t('loading.validate'));
-        try { state.validationReport = await invoke('run_validation'); } finally { hideLoading(); }
+      const hasStatusCol = !!state.fa.status.col;
+      if (hasStatusCol) {
+        state.statusMode = 'column';
+        state.statusColOverride = state.fa.status.col;
+        showLoading(t('loading.statusVocab'));
+        try {
+          await loadStatusVocab(state.fa.status.col);
+        } catch (e) {
+          showError(String(e));
+        } finally {
+          hideLoading();
+        }
+        state.step = STEP.STATUS;
+      } else if (state.censusType === 'single') {
+        state.step = STEP.SPECIES;
+      } else {
+        state.statusMode = 'derive';
+        state.step = STEP.STATUS;
       }
       render();
     } finally { hideLoading(); }
@@ -1410,7 +2118,7 @@ async function advanceStep() {
   }
 
   // Harmonize inventory (wide): pivot
-  if (state.mode === 'harmonize' && state.step === STEP.INVENTORY && state.dataFormat === 'wide') {
+  if (state.step === STEP.INVENTORY && state.dataFormat === 'wide') {
     showLoading(t('loading.pivot'));
     try {
       const wideIdentityExprs = buildFieldExprs().filter(f =>
@@ -1423,41 +2131,83 @@ async function advanceStep() {
           dbh_pairs:      state.widePairs.filter(p=>state.wideDbhCols.includes(p.source_column)&&p.year>0),
           status_remaps:     [],
           metadata: {
-            country:      state.country  || null,
-            site:         state.siteName || null,
-            pi:           state.piName   || null,
-            dbh_unit:     state.dbhUnit,
+            ...buildMetadataPayload(),
             census_years: state.widePairs.filter(p=>p.year>0).map(p=>p.year),
-            census_type:  state.censusType,
           },
         },
       });
       state.deriveResult = null;
+      if (state.fa.status.col) {
+        state.statusMode = 'column';
+        state.statusColOverride = state.fa.status.col;
+        showLoading(t('loading.statusVocab'));
+        try { await loadStatusVocab(state.fa.status.col); }
+        catch (e) { showError(String(e)); }
+        finally { hideLoading(); }
+      } else {
+        state.statusMode = 'derive';
+      }
       state.step = STEP.STATUS; render();
     } finally { hideLoading(); }
     return;
   }
 
-  // Harmonize status → validate
-  if (state.mode === 'harmonize' && state.step === STEP.STATUS) {
+  // Harmonize status → species (TNRS)
+  if (state.step === STEP.STATUS) {
     if (state.statusMode === 'column') {
-      // Re-apply with the status column included
       showLoading(t('loading.statusCol'));
       try {
-        await invoke('apply_fields_mapping', {
-          request: {
-            gfb3_dsn: state.gfb3Dsn,
-            fields:   buildFieldExprs(),
-            dbh_unit: state.dbhUnit,
-            status_remaps: [],
-            metadata: { country: state.country||null, site: state.siteName||null, pi: state.piName||null, dbh_unit: state.dbhUnit, census_years: state.censusYears, census_type: state.censusType },
-          },
-        });
+        const meta = {
+          ...buildMetadataPayload(),
+          census_years: state.dataFormat === 'wide'
+            ? state.widePairs.filter(p => p.year > 0).map(p => p.year)
+            : state.censusYears,
+        };
+        const remaps = buildStatusRemaps();
+        if (state.dataFormat === 'wide') {
+          await invoke('apply_wide_mapping', {
+            request: {
+              gfb3_dsn: state.gfb3Dsn,
+              identity_exprs: buildFieldExprs().filter(f => !['DBH', 'YR'].includes(f.target_col)),
+              dbh_pairs: state.widePairs.filter(p => state.wideDbhCols.includes(p.source_column) && p.year > 0),
+              status_remaps: remaps,
+              metadata: meta,
+            },
+          });
+        } else {
+          await invoke('apply_fields_mapping', {
+            request: {
+              gfb3_dsn: state.gfb3Dsn,
+              fields: buildFieldExprs(),
+              dbh_unit: state.dbhUnit,
+              status_remaps: remaps,
+              metadata: meta,
+            },
+          });
+        }
+      } finally { hideLoading(); }
+    }
+    state.step = STEP.SPECIES;
+    render();
+    return;
+  }
+
+  // Species → apply resolutions → validate
+  if (state.step === STEP.SPECIES) {
+    const remaps = Object.entries(state.speciesResolutions)
+      .filter(([o, r]) => r && r !== o)
+      .map(([original, resolved]) => ({ original, resolved }));
+    if (remaps.length) {
+      showLoading(t('loading.speciesApply'));
+      try {
+        await invoke('apply_species_resolutions', { request: { remaps } });
       } finally { hideLoading(); }
     }
     showLoading(t('loading.validate'));
     try {
-      state.validationReport = await invoke('run_validation');
+      const result = await invoke('run_validation');
+      state.validationReport = result.validation ?? result;
+      state.diagnosticReport = result.diagnostic ?? null;
       state.step = STEP.VALIDATE; render();
     } finally { hideLoading(); }
     return;
@@ -1471,11 +2221,18 @@ function collectStep3Dom() {
   state.contact.firstName  = v('f-firstname') || state.contact.firstName;
   state.contact.middleName = v('f-midname')   || state.contact.middleName;
   state.contact.lastName   = v('f-lastname')  || state.contact.lastName;
+  state.contact.email      = v('f-contact-email') || state.contact.email;
   const ctryVal = v('f-country');
   if (ctryVal) { state.countryName = ctryVal; state.country = isoFromCountry(ctryVal).toUpperCase(); }
   state.submitYear = v('f-submityear') || state.submitYear;
   state.siteName   = v('f-site')  || state.siteName;
-  state.piName     = v('f-pi')    || state.piName;
+  if (state.piSameAsContact) {
+    syncPiFromContact();
+  } else {
+    state.piName  = v('f-pi') || state.piName;
+    state.piEmail = v('f-pi-email') || state.piEmail;
+  }
+  state.curatorName = v('f-curator') || state.curatorName;
   const ru = document.querySelector('input[name="dbh-unit"]:checked');
   state.dbhUnit = ru ? ru.value : state.dbhUnit;
   const rc = document.querySelector('input[name="census-type"]:checked');
@@ -1488,28 +2245,39 @@ function buildFieldExprs() {
   const fa = state.fa;
   const pl = state.plotLookup;
   const fields = [];
+  const real = new Set(usableCols());
 
-  // PlotID
-  const plotCols = fa.plotId.cols;
-  const prefix   = fa.plotId.prefix.trim();
+  // PlotID — only real source columns from the loaded file
+  const plotCols = (fa.plotId.cols || []).filter(c => real.has(c));
+  const prefix   = (fa.plotId.prefix || '').trim();
   if (plotCols.length === 1 && !prefix) {
     fields.push({ kind:'column', target_col:'PlotID', source: plotCols[0] });
-  } else if (plotCols.length >= 1) {
-    fields.push({ kind:'concat', target_col:'PlotID', sources: plotCols, sep:'_', to_lower:true, prefix: prefix || null });
+  } else if (plotCols.length >= 1 || prefix) {
+    fields.push({
+      kind: 'concat',
+      target_col: 'PlotID',
+      sources: [...plotCols],
+      sep: '_',
+      to_lower: true,
+      prefix: prefix || null,
+    });
   }
 
-  // TreeID — no auto-prepend; user selects exactly which columns to use
-  const treeCols = fa.treeId.cols;
-  if (treeCols.length === 1) {
+  // TreeID — real columns only. May include PlotID after it is built above.
+  const treeCols = (fa.treeId.cols || []).filter(c => real.has(c) || c === 'PlotID');
+  if (treeCols.length === 1 && treeCols[0] !== 'PlotID') {
     fields.push({ kind:'column', target_col:'TreeID', source: treeCols[0] });
-  } else if (treeCols.length > 1) {
-    fields.push({ kind:'concat', target_col:'TreeID', sources: treeCols, sep:'_', to_lower:true, prefix: null });
+  } else if (treeCols.length >= 1) {
+    fields.push({ kind:'concat', target_col:'TreeID', sources: [...treeCols], sep:'_', to_lower:true, prefix: null });
   }
 
   // Single-column measurement fields
-  if (fa.dbh.col)     fields.push({ kind:'column', target_col:'DBH',     source: fa.dbh.col });
-  if (fa.yr.col)      fields.push({ kind:'column', target_col:'YR',      source: fa.yr.col });
-  if (fa.species.col) fields.push({ kind:'column', target_col:'Species', source: fa.species.col });
+  if (fa.dbh.col && real.has(fa.dbh.col))
+    fields.push({ kind:'column', target_col:'DBH', source: fa.dbh.col });
+  if (fa.yr.col && real.has(fa.yr.col))
+    fields.push({ kind:'year_from_column', target_col:'YR', source: fa.yr.col });
+  if (fa.species.col && real.has(fa.species.col))
+    fields.push({ kind:'column', target_col:'Species', source: fa.species.col });
 
   // Lat/Lon/PA — lookup takes precedence over direct column/literal
   const lookupBase = pl.enabled && pl.filePath && pl.mainKeyCol && pl.lookupKeyCol
@@ -1540,26 +2308,83 @@ function buildFieldExprs() {
     fields.push({ kind:'literal', target_col:'PA', value: fa.pa.literal });
   }
 
-  // Status — only if column mode
-  if (state.statusMode === 'column') {
-    const stCol = state.statusColOverride || fa.status.col;
-    if (stCol) fields.push({ kind:'column', target_col:'Status', source: stCol });
-  }
+  // Status — include whenever chosen in inventory (or column mode override)
+  const stCol = state.fa.status.col || (state.statusMode === 'column' ? activeStatusCol() : '');
+  if (stCol) fields.push({ kind:'column', target_col:'Status', source: stCol });
 
   return fields;
 }
 
 // ── Export ─────────────────────────────────────────────────────────────────────
+async function exportDiagnostic(format) {
+  clearError();
+  if (!state.diagnosticReport) {
+    showError(t('step6.loading'));
+    return;
+  }
+  const isMulti = (state.diagnosticReport.census_type || state.censusType) === 'multi';
+  const suffix = isMulti ? '_gfb3_report' : '_gfb2_report';
+  const base = (state.diagnosticReport.dataset_name || state.gfb3Dsn || 'dataset').replace(/[^\w\-]+/g, '_');
+  const ext = format === 'pdf' ? 'pdf' : 'html';
+  const filters = format === 'pdf'
+    ? [{ name: 'PDF', extensions: ['pdf'] }]
+    : [{ name: 'HTML', extensions: ['html'] }];
+  const path = await saveDialog({
+    defaultPath: `${base}${suffix}.${ext}`,
+    filters,
+  });
+  if (!path) return;
+  showLoading(t('loading.exporting'));
+  try {
+    const saved = await invoke('export_diagnostic_report', {
+      request: { path, format },
+    });
+    clearError();
+    const bar = document.querySelector('.diag-export-bar');
+    if (bar) {
+      let note = document.getElementById('diag-export-note');
+      if (!note) {
+        note = document.createElement('p');
+        note.id = 'diag-export-note';
+        note.style.cssText = 'width:100%;margin:.35rem 0 0;font-size:.82rem;color:var(--green-dark)';
+        bar.appendChild(note);
+      }
+      note.textContent = t('step6.exportDone', { path: saved });
+    }
+  } catch (e) {
+    showError(String(e));
+  } finally {
+    hideLoading();
+  }
+}
+
 async function doExport() {
   clearError();
-  const outDir  = (document.getElementById('f-outdir') ||{}).value||'';
+  const outDir  = state.exportOutDir || (document.getElementById('f-outdir') ||{}).value||'';
   const base    = (document.getElementById('f-basename')||{}).value||state.gfb3Dsn||'dataset';
   const formats = [...document.querySelectorAll('input[name="fmt"]:checked')].map(e=>e.value);
   if (!outDir.trim()) { showError(t('error.chooseOutDir')); return; }
   if (!formats.length) { showError(t('error.chooseFormat')); return; }
+  const constantExpan = (!state.fixedArea && state.expanMode === 'constant' && state.constantExpan !== '')
+    ? Number(state.constantExpan)
+    : null;
+  if (constantExpan != null && (!Number.isFinite(constantExpan) || constantExpan < 0)) {
+    showError(t('error.invalidExpan'));
+    return;
+  }
   showLoading(t('loading.exporting'));
   try {
-    const files = await invoke('export', { request: { output_dir: outDir, base_name: base, formats } });
+    const files = await invoke('export', {
+      request: {
+        output_dir: outDir,
+        base_name: base,
+        formats,
+        keep_alive_only: state.keepAliveOnly,
+        fixed_area: state.fixedArea,
+        constant_expan: constantExpan,
+        curator: state.curatorName.trim(),
+      },
+    });
     document.getElementById('export-result').innerHTML = `
       <div class="finding finding-clean" style="margin-top:1rem">
         <div class="finding-header"><span class="finding-rule">${t('step7.exportComplete')}</span><span class="badge badge-clean">${t('step7.files', { count: files.length })}</span></div>
@@ -1568,8 +2393,493 @@ async function doExport() {
   } catch(e) { showError(String(e)); } finally { hideLoading(); }
 }
 
-// ── Leaflet map ────────────────────────────────────────────────────────────────
+// ── Leaflet map (centroid picker modal + plot map workspace) ───────────────────
 let leafletMap = null, leafletMarker = null, pickedLatLon = null;
+let plotLeafletMap = null;
+let plotLeafletLayerGroup = null;
+let plotLeafletBaseLayers = null;
+let plotSymbolLegend = null;
+
+const MAP_SYMBOL_COLORS = [
+  '#2d6a4f', '#457b9d', '#e76f51', '#f4a261', '#e9c46a', '#2a9d8f',
+  '#264653', '#9b2226', '#bb3e03', '#0a9396', '#6d597a', '#b56576',
+  '#355070', '#ee9b00', '#94d2bd', '#005f73', '#ae2012', '#ca6702',
+  '#1d3557', '#e56b6f', '#eaac8b', '#40916c', '#52b788', '#6a994e',
+];
+const MAP_SYMBOL_DEFAULT = '#52b788';
+const MAP_SYMBOL_OTHER = '#6c757d';
+const MAP_SYMBOL_MAX = 20;
+
+const MAP_CRS_OPTIONS = [
+  { id: 'EPSG:4326', label: 'WGS 84 (EPSG:4326) — degrees' },
+  { id: 'EPSG:3857', label: 'Web Mercator (EPSG:3857)' },
+  { id: 'EPSG:4269', label: 'NAD83 (EPSG:4269) — degrees' },
+  { id: 'EPSG:4214', label: 'Beijing 1954 (EPSG:4214) — degrees' },
+  { id: 'UTM_N', label: 'UTM Northern hemisphere (enter zone below)' },
+  { id: 'UTM_S', label: 'UTM Southern hemisphere (enter zone below)' },
+];
+
+function ensureProj4Defs() {
+  if (typeof proj4 === 'undefined') return;
+  if (!proj4.defs['EPSG:3857']) {
+    proj4.defs('EPSG:3857', '+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs +type=crs');
+  }
+  if (!proj4.defs['EPSG:4269']) {
+    proj4.defs('EPSG:4269', '+proj=longlat +datum=NAD83 +no_defs +type=crs');
+  }
+}
+
+function resolveMapCrsCode() {
+  const mv = state.mapView;
+  if (mv.crs === 'UTM_N' || mv.crs === 'UTM_S') {
+    const z = parseInt(mv.utmZone, 10);
+    if (!z || z < 1 || z > 60) return null;
+    const epsg = (mv.crs === 'UTM_N' ? 32600 : 32700) + z;
+    const code = `EPSG:${epsg}`;
+    if (typeof proj4 !== 'undefined' && !proj4.defs[code]) {
+      const hemi = mv.crs === 'UTM_N' ? '+north' : '+south';
+      proj4.defs(code, `+proj=utm +zone=${z} ${hemi} +datum=WGS84 +units=m +no_defs +type=crs`);
+    }
+    return code;
+  }
+  return mv.crs || 'EPSG:4326';
+}
+
+function projectToWgs84(yOrLat, xOrLon, crsCode) {
+  if (!crsCode || crsCode === 'EPSG:4326') {
+    return { lat: yOrLat, lon: xOrLon };
+  }
+  ensureProj4Defs();
+  if (typeof proj4 === 'undefined') {
+    throw new Error('proj4 not loaded — cannot convert CRS');
+  }
+  // proj4 expects [x, y] = [easting/lon, northing/lat]
+  const [lon, lat] = proj4(crsCode, 'EPSG:4326', [xOrLon, yOrLat]);
+  return { lat, lon };
+}
+
+function mapColOptions(selected) {
+  const opts = usableCols().map(c =>
+    `<option value="${esc(c)}" ${c === selected ? 'selected' : ''}>${esc(c)}</option>`
+  ).join('');
+  return `<option value="">${esc(t('common.selectColumn'))}</option>${opts}`;
+}
+
+function renderMapView() {
+  if (!state.loadResult) {
+    return `<div class="plot-map-view">
+      <h2>${esc(t('plotMap.title'))}</h2>
+      <p class="step-desc">${esc(t('plotMap.desc'))}</p>
+      <div class="plot-map-empty">${esc(t('plotMap.needFile'))}</div>
+    </div>`;
+  }
+  const mv = state.mapView;
+  const showUtm = mv.crs === 'UTM_N' || mv.crs === 'UTM_S';
+  const crsOpts = MAP_CRS_OPTIONS.map(o =>
+    `<option value="${o.id}" ${mv.crs === o.id ? 'selected' : ''}>${esc(o.label)}</option>`
+  ).join('');
+  const statusText = mv.status || (mv.latCol && mv.lonCol ? '' : t('plotMap.pickCols'));
+  return `<div class="plot-map-view">
+    <div>
+      <h2>${esc(t('plotMap.title'))}</h2>
+      <p class="step-desc">${esc(t('plotMap.desc'))}</p>
+    </div>
+    <div class="plot-map-toolbar">
+      <div class="plot-map-field">
+        <label for="map-lat-col">${esc(t('plotMap.lat'))}</label>
+        <select id="map-lat-col">${mapColOptions(mv.latCol)}</select>
+      </div>
+      <div class="plot-map-field">
+        <label for="map-lon-col">${esc(t('plotMap.lon'))}</label>
+        <select id="map-lon-col">${mapColOptions(mv.lonCol)}</select>
+      </div>
+      <div class="plot-map-field">
+        <label for="map-label-col">${esc(t('plotMap.label'))}</label>
+        <select id="map-label-col">${mapColOptions(mv.labelCol)}</select>
+      </div>
+      <div class="plot-map-field">
+        <label for="map-symbol-col">${esc(t('plotMap.symbolBy'))}</label>
+        <select id="map-symbol-col">
+          <option value="">${esc(t('plotMap.symbolNone'))}</option>
+          ${usableCols().map(c =>
+            `<option value="${esc(c)}" ${c === mv.symbolCol ? 'selected' : ''}>${esc(c)}</option>`
+          ).join('')}
+        </select>
+      </div>
+      <div class="plot-map-field" style="min-width:14rem">
+        <label for="map-crs">${esc(t('plotMap.crs'))}</label>
+        <select id="map-crs">${crsOpts}</select>
+      </div>
+      ${showUtm ? `<div class="plot-map-field" style="min-width:6rem">
+        <label for="map-utm-zone">UTM zone</label>
+        <input type="number" id="map-utm-zone" min="1" max="60" value="${esc(mv.utmZone || '')}" style="padding:.35rem .45rem;border:1px solid var(--border);border-radius:var(--radius);width:5rem" />
+      </div>` : ''}
+      <div class="plot-map-actions">
+        <button type="button" class="btn btn-primary" id="map-plot-btn">${esc(t('plotMap.plot'))}</button>
+        <button type="button" class="btn btn-ghost" id="map-save-html" ${mv.points.length ? '' : 'disabled'}>${esc(t('plotMap.saveHtml'))}</button>
+      </div>
+      <div class="plot-map-status ${(!mv.latCol || !mv.lonCol) ? 'warn' : ''}" id="map-status">${esc(statusText)}</div>
+    </div>
+    <p style="font-size:.78rem;color:var(--text-muted);margin:0">${esc(t('plotMap.crsHint'))}</p>
+    <div class="plot-map-canvas-wrap">
+      <div id="plot-map"></div>
+    </div>
+  </div>`;
+}
+
+function maybeAutoSeedMapCols() {
+  const mv = state.mapView;
+  if (!state.loadResult) return;
+  if (!mv.latCol && state.fa.lat.col) mv.latCol = state.fa.lat.col;
+  if (!mv.lonCol && state.fa.lon.col) mv.lonCol = state.fa.lon.col;
+  if (!mv.labelCol) {
+    if (usableCols().includes('PlotID')) mv.labelCol = 'PlotID';
+    else if (state.fa.plotId.cols.length) mv.labelCol = state.fa.plotId.cols[0];
+  }
+  if (mv.latCol && mv.lonCol) return;
+  if (mv.autoTried) return;
+  mv.autoTried = true;
+  const norm = c => String(c).toLowerCase().replace(/[\s-]+/g, '_');
+  const cols = usableCols();
+  const find = aliases => cols.find(c => aliases.includes(norm(c)));
+  if (!mv.latCol) {
+    mv.latCol = find(['lat', 'latitude', 'latitud', 'y_lat', 'coord_y', 'coords_y']) || '';
+  }
+  if (!mv.lonCol) {
+    mv.lonCol = find(['lon', 'long', 'longitude', 'longitud', 'lng', 'x_lon', 'x_long', 'coord_x', 'coords_x']) || '';
+  }
+  if (!mv.labelCol) {
+    mv.labelCol = find(['plotid', 'plot_id', 'plot']) || '';
+  }
+}
+
+function mapSymbolColorMap(points, symbolCol) {
+  const colors = new Map();
+  if (!symbolCol) return colors;
+  const counts = new Map();
+  for (const p of points) {
+    const key = (p.symbol == null || String(p.symbol).trim() === '') ? '(blank)' : String(p.symbol);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  let i = 0;
+  for (const [key] of ranked) {
+    if (i < MAP_SYMBOL_MAX) {
+      colors.set(key, MAP_SYMBOL_COLORS[i % MAP_SYMBOL_COLORS.length]);
+      i += 1;
+    } else {
+      colors.set(key, MAP_SYMBOL_OTHER);
+    }
+  }
+  return colors;
+}
+
+function colorForSymbol(symbol, colorMap, symbolCol) {
+  if (!symbolCol || !colorMap.size) return MAP_SYMBOL_DEFAULT;
+  const key = (symbol == null || String(symbol).trim() === '') ? '(blank)' : String(symbol);
+  return colorMap.get(key) || MAP_SYMBOL_OTHER;
+}
+
+function destroyPlotLeaflet() {
+  if (plotSymbolLegend && plotLeafletMap) {
+    try { plotLeafletMap.removeControl(plotSymbolLegend); } catch (_) {}
+    plotSymbolLegend = null;
+  }
+  if (plotLeafletMap) {
+    try { plotLeafletMap.remove(); } catch (_) {}
+    plotLeafletMap = null;
+    plotLeafletLayerGroup = null;
+    plotLeafletBaseLayers = null;
+  }
+}
+
+function updatePlotSymbolLegend(colorMap, symbolCol) {
+  if (!plotLeafletMap) return;
+  if (plotSymbolLegend) {
+    try { plotLeafletMap.removeControl(plotSymbolLegend); } catch (_) {}
+    plotSymbolLegend = null;
+  }
+  if (!symbolCol || !colorMap.size) return;
+
+  const entries = [...colorMap.entries()];
+  const hasOther = [...colorMap.values()].includes(MAP_SYMBOL_OTHER)
+    && entries.filter(([, c]) => c === MAP_SYMBOL_OTHER).length > 1;
+
+  plotSymbolLegend = L.control({ position: 'bottomleft' });
+  plotSymbolLegend.onAdd = () => {
+    const div = L.DomUtil.create('div', 'plot-map-legend');
+    L.DomEvent.disableClickPropagation(div);
+    L.DomEvent.disableScrollPropagation(div);
+    const title = document.createElement('div');
+    title.className = 'plot-map-legend-title';
+    title.textContent = symbolCol;
+    div.appendChild(title);
+    let otherAdded = false;
+    for (const [label, color] of entries) {
+      if (hasOther && color === MAP_SYMBOL_OTHER) {
+        if (otherAdded) continue;
+        otherAdded = true;
+        const row = document.createElement('div');
+        row.className = 'plot-map-legend-row';
+        row.innerHTML = `<span class="plot-map-legend-swatch" style="background:${MAP_SYMBOL_OTHER}"></span><span>${esc(t('plotMap.symbolOther'))}</span>`;
+        div.appendChild(row);
+        continue;
+      }
+      const row = document.createElement('div');
+      row.className = 'plot-map-legend-row';
+      row.innerHTML = `<span class="plot-map-legend-swatch" style="background:${color}"></span><span>${esc(label)}</span>`;
+      div.appendChild(row);
+    }
+    return div;
+  };
+  plotSymbolLegend.addTo(plotLeafletMap);
+}
+
+function initPlotMapLeaflet() {
+  const elMap = document.getElementById('plot-map');
+  if (!elMap || typeof L === 'undefined') return;
+  destroyPlotLeaflet();
+  plotLeafletMap = L.map(elMap, { worldCopyJump: true }).setView([0, 0], 2);
+
+  const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap',
+    maxZoom: 19,
+  });
+  const terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap, © OpenTopoMap (CC-BY-SA)',
+    maxZoom: 17,
+  });
+  const satellite = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    {
+      attribution: 'Tiles © Esri',
+      maxZoom: 19,
+    }
+  );
+  street.addTo(plotLeafletMap);
+  plotLeafletBaseLayers = {
+    [t('plotMap.layerStreet')]: street,
+    [t('plotMap.layerTerrain')]: terrain,
+    [t('plotMap.layerSatellite')]: satellite,
+  };
+  L.control.layers(plotLeafletBaseLayers, null, { position: 'topright' }).addTo(plotLeafletMap);
+  plotLeafletLayerGroup = L.layerGroup().addTo(plotLeafletMap);
+  setTimeout(() => {
+    plotLeafletMap.invalidateSize();
+    if (state.mapView.points.length) drawPlotMapPoints(state.mapView.points);
+  }, 60);
+}
+
+function drawPlotMapPoints(points) {
+  if (!plotLeafletMap || !plotLeafletLayerGroup) return;
+  plotLeafletLayerGroup.clearLayers();
+  if (!points.length) {
+    updatePlotSymbolLegend(new Map(), '');
+    return;
+  }
+  const symbolCol = state.mapView.symbolCol || '';
+  const colorMap = mapSymbolColorMap(points, symbolCol);
+  const canvasRenderer = L.canvas({ padding: 0.5 });
+  const latLngs = [];
+  for (const p of points) {
+    const ll = [p.lat, p.lon];
+    latLngs.push(ll);
+    const fill = colorForSymbol(p.symbol, colorMap, symbolCol);
+    const m = L.circleMarker(ll, {
+      radius: 5,
+      color: '#1b4332',
+      weight: 1,
+      fillColor: fill,
+      fillOpacity: 0.9,
+      renderer: canvasRenderer,
+    });
+    const tip = p.plot_id || p.label || `${p.lat.toFixed(5)}, ${p.lon.toFixed(5)}`;
+    const tipHtml = symbolCol && p.symbol != null && String(p.symbol).trim() !== ''
+      ? `${esc(tip)}<br><span style="opacity:.85">${esc(symbolCol)}: ${esc(String(p.symbol))}</span>`
+      : esc(tip);
+    m.bindTooltip(tipHtml, { sticky: true, direction: 'top', opacity: 0.95 });
+    plotLeafletLayerGroup.addLayer(m);
+  }
+  updatePlotSymbolLegend(colorMap, symbolCol);
+  try {
+    plotLeafletMap.fitBounds(L.latLngBounds(latLngs).pad(0.15));
+  } catch (_) {}
+}
+
+async function loadAndPlotMapPoints() {
+  clearError();
+  const mv = state.mapView;
+  if (!mv.latCol || !mv.lonCol) {
+    showError(t('plotMap.pickCols'));
+    return;
+  }
+  const crsCode = resolveMapCrsCode();
+  if (!crsCode) {
+    showError('Enter a valid UTM zone (1–60).');
+    return;
+  }
+  showLoading(t('plotMap.loading'));
+  try {
+    const result = await invoke('get_map_points', {
+      latCol: mv.latCol,
+      lonCol: mv.lonCol,
+      labelCol: mv.labelCol || null,
+      symbolCol: mv.symbolCol || null,
+      maxPoints: 25000,
+    });
+    const wgs = [];
+    for (const p of result.points) {
+      try {
+        const c = projectToWgs84(p.lat, p.lon, crsCode);
+        if (!Number.isFinite(c.lat) || !Number.isFinite(c.lon)) continue;
+        if (Math.abs(c.lat) > 90 || Math.abs(c.lon) > 180) continue;
+        wgs.push({
+          lat: c.lat,
+          lon: c.lon,
+          label: p.label || null,
+          plot_id: p.plot_id || p.label || null,
+          symbol: p.symbol || null,
+        });
+      } catch (_) { /* skip bad row */ }
+    }
+    mv.points = wgs;
+    mv.truncated = !!result.truncated;
+    mv.status = wgs.length
+      ? (result.truncated ? t('plotMap.truncated', { n: wgs.length }) : t('plotMap.status', { n: wgs.length }))
+      : t('plotMap.noPoints');
+    drawPlotMapPoints(wgs);
+    const st = document.getElementById('map-status');
+    if (st) st.textContent = mv.status;
+    el('map-save-html', b => { b.disabled = !wgs.length; });
+  } catch (e) {
+    showError(String(e));
+  } finally {
+    hideLoading();
+  }
+}
+
+function buildStandaloneMapHtml(points) {
+  const symbolCol = state.mapView.symbolCol || '';
+  const colorMap = mapSymbolColorMap(points, symbolCol);
+  const colorObj = {};
+  for (const [k, v] of colorMap) colorObj[k] = v;
+  const features = points.map(p => ({
+    type: 'Feature',
+    properties: {
+      plot_id: p.plot_id || p.label || '',
+      label: p.label || p.plot_id || '',
+      symbol: p.symbol == null ? '' : String(p.symbol),
+    },
+    geometry: { type: 'Point', coordinates: [p.lon, p.lat] },
+  }));
+  const geojson = JSON.stringify({ type: 'FeatureCollection', features });
+  const colorsJson = JSON.stringify(colorObj);
+  const symbolColJson = JSON.stringify(symbolCol);
+  const defaultColor = JSON.stringify(MAP_SYMBOL_DEFAULT);
+  const otherColor = JSON.stringify(MAP_SYMBOL_OTHER);
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8" />
+<title>GFB3 plot map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
+<style>
+html,body,#map{margin:0;height:100%;} #map{width:100%;}
+.plot-map-legend{background:#fff;padding:.55rem .7rem;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.25);font:12px/1.35 system-ui,sans-serif;max-height:40vh;overflow:auto;max-width:220px}
+.plot-map-legend-title{font-weight:700;margin-bottom:.35rem}
+.plot-map-legend-row{display:flex;align-items:center;gap:.4rem;margin:.18rem 0}
+.plot-map-legend-swatch{width:12px;height:12px;border-radius:50%;border:1px solid #1b4332;flex-shrink:0}
+</style>
+</head><body>
+<div id="map"></div>
+<script>
+const data = ${geojson};
+const symbolCol = ${symbolColJson};
+const colorMap = ${colorsJson};
+const defaultColor = ${defaultColor};
+const otherColor = ${otherColor};
+function fillFor(sym) {
+  if (!symbolCol) return defaultColor;
+  const key = (!sym || !String(sym).trim()) ? '(blank)' : String(sym);
+  return colorMap[key] || otherColor;
+}
+const map = L.map('map');
+const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap', maxZoom: 19 });
+const terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '© OpenTopoMap', maxZoom: 17 });
+const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '© Esri', maxZoom: 19 });
+street.addTo(map);
+L.control.layers({ Street: street, Terrain: terrain, Satellite: satellite }).addTo(map);
+const layer = L.geoJSON(data, {
+  pointToLayer: (f, latlng) => L.circleMarker(latlng, {
+    radius: 5, color: '#1b4332', weight: 1,
+    fillColor: fillFor(f.properties && f.properties.symbol),
+    fillOpacity: 0.9
+  }),
+  onEachFeature: (f, l) => {
+    const text = (f.properties && (f.properties.plot_id || f.properties.label)) || '';
+    if (text) l.bindTooltip(String(text), { sticky: true, direction: 'top', opacity: 0.95 });
+  }
+}).addTo(map);
+if (symbolCol && Object.keys(colorMap).length) {
+  const legend = L.control({ position: 'bottomleft' });
+  legend.onAdd = function () {
+    const div = L.DomUtil.create('div', 'plot-map-legend');
+    div.innerHTML = '<div class="plot-map-legend-title"></div>';
+    div.querySelector('.plot-map-legend-title').textContent = symbolCol;
+    let otherAdded = false;
+    Object.keys(colorMap).forEach(function (label) {
+      const color = colorMap[label];
+      let text = label;
+      if (color === otherColor) {
+        if (otherAdded) return;
+        otherAdded = true;
+        text = 'Other';
+      }
+      const row = document.createElement('div');
+      row.className = 'plot-map-legend-row';
+      row.innerHTML = '<span class="plot-map-legend-swatch" style="background:' + color + '"></span><span></span>';
+      row.lastChild.textContent = text;
+      div.appendChild(row);
+    });
+    return div;
+  };
+  legend.addTo(map);
+}
+try { map.fitBounds(layer.getBounds().pad(0.15)); } catch (e) { map.setView([0,0], 2); }
+<\/script>
+</body></html>`;
+}
+
+function exportBaseName() {
+  const fromField = (document.getElementById('f-basename') || {}).value;
+  const raw = (fromField || state.gfb3Dsn || computeDsn() || 'dataset').trim();
+  return raw.replace(/[^\w.\-]+/g, '_') || 'dataset';
+}
+
+async function savePlotMapHtml() {
+  clearError();
+  if (!state.mapView.points.length) return;
+  const base = exportBaseName();
+  const path = await saveDialog({
+    defaultPath: `${base}_map.html`,
+    filters: [{ name: 'HTML', extensions: ['html'] }],
+  });
+  if (!path) return;
+  showLoading(t('plotMap.saving'));
+  try {
+    await invoke('save_text_file', {
+      path,
+      contents: buildStandaloneMapHtml(state.mapView.points),
+    });
+    state.mapView.status = t('plotMap.saved', { path });
+    const st = document.getElementById('map-status');
+    if (st) st.textContent = state.mapView.status;
+  } catch (e) {
+    showError(String(e));
+  } finally {
+    hideLoading();
+  }
+}
 
 function openMapModal() {
   const modal = document.getElementById('map-modal');
@@ -1601,6 +2911,18 @@ console.log('=== Forest Data Harmonizer initializing ===');
 I18n.init({ onChange: () => render() });
 window.onerror = (msg, src, line) => { showError(t('error.js', { msg, src, line })); return false; };
 window.addEventListener('unhandledrejection', ev => showError(t('error.generic', { reason: ev.reason })));
+
+// Workspace tabs live in the header (not re-rendered) — bind once
+document.querySelectorAll('.workspace-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const view = btn.dataset.view;
+    if (!view || view === state.workspaceView) return;
+    if (view !== 'map') destroyPlotLeaflet();
+    state.workspaceView = view;
+    clearError();
+    render();
+  });
+});
 
 try {
   render();

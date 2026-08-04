@@ -110,9 +110,9 @@ mod tests {
 
     #[test]
     fn render_contains_curator_header() {
-        let log = CurationLog::new("Francisco Rivas");
+        let log = CurationLog::new("Vandana Shiva");
         let rendered = log.render();
-        assert!(rendered.contains("CURATOR: Francisco Rivas"));
+        assert!(rendered.contains("CURATOR: Vandana Shiva"));
         assert!(rendered.contains("--- SOURCE FORMAT ---"));
     }
 }

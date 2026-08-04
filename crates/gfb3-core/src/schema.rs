@@ -16,7 +16,7 @@ pub enum Gfb3Field {
     Status,
     Dbh,
     Species,
-    /// Contributor dataset identifier (e.g. "site_pi_year").
+    /// InterNodes dataset identifier (in_dsn).
     Dsn,
 }
 
@@ -79,11 +79,137 @@ pub fn gfb3_field_defs() -> Vec<FieldDef> {
         },
         FieldDef {
             field: Gfb3Field::Dsn,
-            column_name: "gfb3_dsn",
+            column_name: "in_dsn",
             dtype: DataType::String,
             nullable: false,
         },
     ]
+}
+
+/// Canonical GFB3 export column order (core + optional inventory extras).
+/// Only columns present in the frame are written.
+pub fn gfb3_export_columns() -> &'static [&'static str] {
+    &[
+        "PlotID",
+        "TreeID",
+        "YR",
+        "PlotYR",
+        "PrevYR",
+        "PrevDBH",
+        "Status",
+        "DBH",
+        "Species",
+        "in_dsn",
+        "Latitude",
+        "Longitude",
+        "PA",
+        "EXPAN",
+    ]
+}
+
+/// GFB2 = GFB3 without Status and Prev* lag columns.
+pub fn gfb2_export_columns() -> &'static [&'static str] {
+    &[
+        "PlotID",
+        "TreeID",
+        "YR",
+        "PlotYR",
+        "DBH",
+        "Species",
+        "in_dsn",
+        "Latitude",
+        "Longitude",
+        "PA",
+        "EXPAN",
+    ]
+}
+
+/// How to populate the tree-level `EXPAN` (expansion factor) column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExpanSpec {
+    /// Fixed-area plots: EXPAN = 1 / PA (PA in hectares; null/≤0 → null).
+    FixedArea,
+    /// Variable-radius / other designs: constant expansion factor for every row.
+    Constant(f64),
+    /// Leave EXPAN blank (null) so the contributor can fill it later.
+    Blank,
+}
+
+/// Add or replace `EXPAN` according to `spec`.
+pub fn with_expan(df: DataFrame, spec: ExpanSpec) -> PolarsResult<DataFrame> {
+    match spec {
+        ExpanSpec::FixedArea => {
+            let names: std::collections::HashSet<String> = df
+                .get_column_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if !names.contains("PA") {
+                return df
+                    .lazy()
+                    .with_columns([lit(NULL).cast(DataType::Float64).alias("EXPAN")])
+                    .collect();
+            }
+            df.lazy()
+                .with_columns([when(
+                    col("PA")
+                        .cast(DataType::Float64)
+                        .gt(lit(0.0f64))
+                        .and(col("PA").cast(DataType::Float64).is_not_null()),
+                )
+                .then(lit(1.0f64) / col("PA").cast(DataType::Float64))
+                .otherwise(lit(NULL).cast(DataType::Float64))
+                .alias("EXPAN")])
+                .collect()
+        }
+        ExpanSpec::Constant(v) => df
+            .lazy()
+            .with_columns([lit(v).alias("EXPAN")])
+            .collect(),
+        ExpanSpec::Blank => df
+            .lazy()
+            .with_columns([lit(NULL).cast(DataType::Float64).alias("EXPAN")])
+            .collect(),
+    }
+}
+
+/// Add `PlotYR` = `{PlotID}_{YR}` (current census year, never PrevYR).
+pub fn with_plot_yr(df: DataFrame) -> PolarsResult<DataFrame> {
+    let names: std::collections::HashSet<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if !names.contains("PlotID") || !names.contains("YR") {
+        return Ok(df);
+    }
+    df.lazy()
+        .with_columns([concat_str(
+            [
+                col("PlotID").cast(DataType::String),
+                lit("_"),
+                col("YR").cast(DataType::String),
+            ],
+            "",
+            true,
+        )
+        .alias("PlotYR")])
+        .collect()
+}
+
+/// Project a frame to `wanted` columns that exist, preserving `wanted` order.
+pub fn select_export_columns(df: DataFrame, wanted: &[&str]) -> PolarsResult<DataFrame> {
+    let present: std::collections::HashSet<String> = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let cols: Vec<&str> = wanted
+        .iter()
+        .copied()
+        .filter(|n| present.contains(*n))
+        .collect();
+    df.select(cols)
 }
 
 /// Looks up a field definition by canonical column name.
@@ -246,5 +372,33 @@ mod tests {
         assert_eq!(dupes, vec!["A"]);
         // Real gate should still pass the valid df
         assert!(InputGate::is_ok(&df));
+    }
+
+    #[test]
+    fn expan_fixed_area_is_reciprocal_of_pa() {
+        let df = make_df(vec![Series::new(
+            "PA".into(),
+            &[Some(0.1f64), Some(1.0), Some(0.0), None],
+        )]);
+        let out = with_expan(df, ExpanSpec::FixedArea).unwrap();
+        let expan = out.column("EXPAN").unwrap().f64().unwrap();
+        assert!((expan.get(0).unwrap() - 10.0).abs() < 1e-9);
+        assert!((expan.get(1).unwrap() - 1.0).abs() < 1e-9);
+        assert!(expan.get(2).is_none());
+        assert!(expan.get(3).is_none());
+    }
+
+    #[test]
+    fn expan_constant_and_blank() {
+        let df = make_df(vec![Series::new("PlotID".into(), &["P1", "P2"])]);
+        let c = with_expan(df.clone(), ExpanSpec::Constant(6.25)).unwrap();
+        let expan = c.column("EXPAN").unwrap().f64().unwrap();
+        assert_eq!(expan.get(0), Some(6.25));
+        assert_eq!(expan.get(1), Some(6.25));
+
+        let b = with_expan(df, ExpanSpec::Blank).unwrap();
+        let expan = b.column("EXPAN").unwrap().f64().unwrap();
+        assert!(expan.get(0).is_none());
+        assert!(expan.get(1).is_none());
     }
 }
