@@ -13,22 +13,23 @@ async function initTauri() {
 const invoke = async (cmd, args = {}) => {
   if (!invokeApi) await initTauri();
   if (!invokeApi || typeof invokeApi.invoke !== 'function')
-    throw new Error('Tauri core.invoke not available.');
+    throw new Error(t('error.tauriInvoke'));
   return invokeApi.invoke(cmd, args);
 };
 const openDialog = async (opts = {}) => {
   if (!dialogApi) await initTauri();
-  if (!dialogApi || typeof dialogApi.open !== 'function') throw new Error('Dialog API not available');
+  if (!dialogApi || typeof dialogApi.open !== 'function') throw new Error(t('error.dialogOpen'));
   return dialogApi.open(opts);
 };
 const saveDialog = async (opts = {}) => {
   if (!dialogApi) await initTauri();
-  if (!dialogApi || typeof dialogApi.save !== 'function') throw new Error('Save dialog not available');
+  if (!dialogApi || typeof dialogApi.save !== 'function') throw new Error(t('error.dialogSave'));
   return dialogApi.save(opts);
 };
 
 // ── i18n ──────────────────────────────────────────────────────────────────────
 const t = (key, params) => I18n.t(key, params);
+const appLocale = () => I18n.getLocale();
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const HARMONIZE_STEP_KEYS = ['steps.setup', 'steps.mode', 'steps.format', 'steps.inventory', 'steps.status', 'steps.species', 'steps.validate', 'steps.export'];
@@ -401,7 +402,7 @@ function renderStepIndicator() {
 function renderSetup() {
   const lr = state.loadResult;
   const gate = lr && lr.gate_errors.length
-    ? `<div class="gate-errors"><h3>${t('step0.gateTitle')}</h3><ul>${lr.gate_errors.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>`
+    ? `<div class="gate-errors"><h3>${t('step0.gateTitle')}</h3><ul>${lr.gate_errors.map(e=>`<li>${esc(fmtGateError(e))}</li>`).join('')}</ul></div>`
     : (lr ? `<p class="file-chosen" style="margin-top:.5rem">${t('step0.structureOk')}</p>` : '');
 
   const preview = lr ? `
@@ -500,8 +501,8 @@ function renderSetup() {
 
       <label>${t('step3.dbhUnit')}</label>
       <div class="radio-group">
-        <label><input type="radio" name="dbh-unit" value="cm" ${state.dbhUnit==='cm'?'checked':''} /> cm</label>
-        <label><input type="radio" name="dbh-unit" value="mm" ${state.dbhUnit==='mm'?'checked':''} /> mm <span style="color:var(--text-muted)">${t('step3.mmHint')}</span></label>
+        <label><input type="radio" name="dbh-unit" value="cm" ${state.dbhUnit==='cm'?'checked':''} /> ${t('step3.unitCm')}</label>
+        <label><input type="radio" name="dbh-unit" value="mm" ${state.dbhUnit==='mm'?'checked':''} /> ${t('step3.unitMm')} <span style="color:var(--text-muted)">${t('step3.mmHint')}</span></label>
       </div>
     </div>
 
@@ -1304,7 +1305,7 @@ function renderStep6() {
             <span class="badge badge-${cls}">${esc(fmtSev(f.severity))}</span>
             <span class="finding-count">${t('step6.rowCount', { count: f.row_count.toLocaleString() })}</span>
           </div>
-          <p class="finding-message">${esc(f.message)}</p>
+          <p class="finding-message">${esc(fmtValidationMessage(f))}</p>
           <div class="finding-action">${t('common.action')}: <strong>${esc(fmtAction(f.action))}</strong></div>
         </div>`;
       }).join('');
@@ -1365,9 +1366,9 @@ function renderStep7() {
     </div>
     <p class="section-heading" style="margin-top:0">${t('step7.formats')}</p>
     <div class="export-formats">
-      <label class="format-card"><input type="checkbox" name="fmt" value="csv"     checked /> CSV</label>
-      <label class="format-card"><input type="checkbox" name="fmt" value="parquet" checked /> Parquet</label>
-      <label class="format-card"><input type="checkbox" name="fmt" value="xlsx"    checked /> XLSX</label>
+      <label class="format-card"><input type="checkbox" name="fmt" value="csv"     checked /> ${t('step7.fmtCsv')}</label>
+      <label class="format-card"><input type="checkbox" name="fmt" value="parquet" checked /> ${t('step7.fmtParquet')}</label>
+      <label class="format-card"><input type="checkbox" name="fmt" value="xlsx"    checked /> ${t('step7.fmtXlsx')}</label>
     </div>
     <button class="btn btn-primary btn-lg" id="do-export">${t('step7.exportBtn')}</button>
     <div id="export-result"></div>
@@ -1394,7 +1395,7 @@ function renderDiagnoseStep2() {
     ? `<div class="finding finding-clean"><div class="finding-header"><span class="finding-rule">${t('step6.allPassed')}</span><span class="badge badge-clean">${t('step6.clean')}</span></div><p class="finding-message">${t('diagnose.allPassedMsg')}</p></div>`
     : findings.map(f => {
         const cls = { AutoDrop: 'auto', AutoRecode: 'recode', RequiresInput: 'input', Escalate: 'escalate' }[f.severity] || 'recode';
-        return `<div class="finding finding-${cls}"><div class="finding-header"><span class="finding-rule">${esc(fmtRule(f.rule))}</span><span class="badge badge-${cls}">${esc(fmtSev(f.severity))}</span><span class="finding-count">${t('step6.rowCount', { count: f.row_count.toLocaleString() })}</span></div><p class="finding-message">${esc(f.message)}</p><div class="finding-action">${t('common.action')}: <strong>${esc(fmtAction(f.action))}</strong></div></div>`;
+        return `<div class="finding finding-${cls}"><div class="finding-header"><span class="finding-rule">${esc(fmtRule(f.rule))}</span><span class="badge badge-${cls}">${esc(fmtSev(f.severity))}</span><span class="finding-count">${t('step6.rowCount', { count: f.row_count.toLocaleString() })}</span></div><p class="finding-message">${esc(fmtValidationMessage(f))}</p><div class="finding-action">${t('common.action')}: <strong>${esc(fmtAction(f.action))}</strong></div></div>`;
       }).join('');
 
   const diagHtml = diag?.html ? `<div class="diag-panel">${diag.html}</div>` : '';
@@ -1442,6 +1443,31 @@ function fmtRule(r) {
     NoPersistentTreeId: t('rule.noPersistentTreeId'),
   }[r] || r;
 }
+function fmtGateError(e) {
+  if (typeof e === 'string') return e;
+  const code = e.code || '';
+  const key = `gate.${code}`;
+  return t(key, { name: e.name || '', count: e.count ?? 0 });
+}
+
+function fmtValidationMessage(f) {
+  const count = f.row_count ?? 0;
+  const valuesMatch = (f.message || '').match(/found: ([^)]+)\)/);
+  const values = valuesMatch ? valuesMatch[1] : '';
+  const keyMap = {
+    DuplicateTreeWithinPlotYear: 'validation.duplicate',
+    UnknownStatus: 'validation.unknownStatus',
+    DeadTreeHasDbh: 'validation.deadHasDbh',
+    RecruitMissingDbh: 'validation.recruitMissingDbh',
+    OrphanDeadFirstCensus: 'validation.orphanDead',
+    RecruitAtMinYear: 'validation.recruitMinYear',
+    NoPersistentTreeId: 'validation.noPersistentTreeId',
+  };
+  const key = keyMap[f.rule];
+  if (key) return t(key, { count, values });
+  return f.message || '';
+}
+
 function fmtAction(a) {
   return {
     DropRows: t('action.dropRows'),
@@ -1455,26 +1481,26 @@ function fmtAction(a) {
 
 function buildCurationLog() {
   const lines = [
-    `DATASET: ${state.gfb3Dsn}`,
-    `COUNTRY: ${state.country}`,
-    `SITE: ${state.siteName}`,
-    `PI: ${state.piName}`,
-    `CONTRIBUTOR: ${[state.contact.firstName, state.contact.middleName, state.contact.lastName].filter(Boolean).join(' ')}`,
-    `CURATOR: ${state.curatorName.trim()}`,
-    `DATE RECEIVED: `,
-    `DATE PROCESSED: ${new Date().toISOString().slice(0,10)}`,
-    `--- SOURCE FORMAT ---`,
+    `${t('curation.dataset')} ${state.gfb3Dsn}`,
+    `${t('curation.country')} ${state.country}`,
+    `${t('curation.site')} ${state.siteName}`,
+    `${t('curation.pi')} ${state.piName}`,
+    `${t('curation.contributor')} ${[state.contact.firstName, state.contact.middleName, state.contact.lastName].filter(Boolean).join(' ')}`,
+    `${t('curation.curator')} ${state.curatorName.trim()}`,
+    `${t('curation.dateReceived')} `,
+    `${t('curation.dateProcessed')} ${new Date().toISOString().slice(0,10)}`,
+    t('curation.sectionSource'),
     `  ${state.filePath?(state.filePath.split(/[/\\]/).pop()):''}`,
-    `--- PIVOT / RESTRUCTURING ---`, ``,
-    `--- DUPLICATE RESOLUTION ---`, ``,
-    `--- MISSING / INTERPOLATED DATA ---`, ``,
-    `--- SPECIES ISSUES ---`, ``,
-    `--- EXCLUSIONS ---`, ``,
-    `--- NOTES ---`,
+    t('curation.sectionPivot'), ``,
+    t('curation.sectionDuplicate'), ``,
+    t('curation.sectionMissing'), ``,
+    t('curation.sectionSpecies'), ``,
+    t('curation.sectionExclusions'), ``,
+    t('curation.sectionNotes'),
   ];
   if (state.validationReport) {
     state.validationReport.findings.filter(f=>f.severity==='Escalate').forEach(f=>{
-      lines.push(`  [AUTO-FLAGGED] ${fmtRule(f.rule)} (${f.row_count} rows) — ${f.message}`);
+      lines.push(`  ${t('curation.autoFlagged')} ${fmtRule(f.rule)} (${f.row_count} ${t('common.rows')}) — ${fmtValidationMessage(f)}`);
     });
   }
   return lines.join('\n');
@@ -2031,7 +2057,7 @@ async function advanceStep() {
     showLoading(t('loading.integrity'));
     try {
       await invoke('use_raw_as_gfb3');
-      const result = await invoke('run_validation');
+      const result = await invoke('run_validation', { locale: appLocale() });
       state.validationReport = result.validation ?? result;
       state.diagnosticReport = result.diagnostic ?? null;
       state.step = DIAGNOSE_STEP_KEYS.length - 1; render();
@@ -2205,7 +2231,7 @@ async function advanceStep() {
     }
     showLoading(t('loading.validate'));
     try {
-      const result = await invoke('run_validation');
+      const result = await invoke('run_validation', { locale: appLocale() });
       state.validationReport = result.validation ?? result;
       state.diagnosticReport = result.diagnostic ?? null;
       state.step = STEP.VALIDATE; render();
@@ -2327,8 +2353,8 @@ async function exportDiagnostic(format) {
   const base = (state.diagnosticReport.dataset_name || state.gfb3Dsn || 'dataset').replace(/[^\w\-]+/g, '_');
   const ext = format === 'pdf' ? 'pdf' : 'html';
   const filters = format === 'pdf'
-    ? [{ name: 'PDF', extensions: ['pdf'] }]
-    : [{ name: 'HTML', extensions: ['html'] }];
+    ? [{ name: t('dialog.filterPdf'), extensions: ['pdf'] }]
+    : [{ name: t('dialog.filterHtml'), extensions: ['html'] }];
   const path = await saveDialog({
     defaultPath: `${base}${suffix}.${ext}`,
     filters,
@@ -2337,7 +2363,7 @@ async function exportDiagnostic(format) {
   showLoading(t('loading.exporting'));
   try {
     const saved = await invoke('export_diagnostic_report', {
-      request: { path, format },
+      request: { path, format, locale: appLocale() },
     });
     clearError();
     const bar = document.querySelector('.diag-export-bar');
@@ -2383,6 +2409,7 @@ async function doExport() {
         fixed_area: state.fixedArea,
         constant_expan: constantExpan,
         curator: state.curatorName.trim(),
+        locale: appLocale(),
       },
     });
     document.getElementById('export-result').innerHTML = `
@@ -2410,13 +2437,13 @@ const MAP_SYMBOL_DEFAULT = '#52b788';
 const MAP_SYMBOL_OTHER = '#6c757d';
 const MAP_SYMBOL_MAX = 20;
 
-const MAP_CRS_OPTIONS = [
-  { id: 'EPSG:4326', label: 'WGS 84 (EPSG:4326) — degrees' },
-  { id: 'EPSG:3857', label: 'Web Mercator (EPSG:3857)' },
-  { id: 'EPSG:4269', label: 'NAD83 (EPSG:4269) — degrees' },
-  { id: 'EPSG:4214', label: 'Beijing 1954 (EPSG:4214) — degrees' },
-  { id: 'UTM_N', label: 'UTM Northern hemisphere (enter zone below)' },
-  { id: 'UTM_S', label: 'UTM Southern hemisphere (enter zone below)' },
+const MAP_CRS_OPTIONS = () => [
+  { id: 'EPSG:4326', labelKey: 'crs.epsg4326' },
+  { id: 'EPSG:3857', labelKey: 'crs.epsg3857' },
+  { id: 'EPSG:4269', labelKey: 'crs.epsg4269' },
+  { id: 'EPSG:4214', labelKey: 'crs.epsg4214' },
+  { id: 'UTM_N', labelKey: 'crs.utmN' },
+  { id: 'UTM_S', labelKey: 'crs.utmS' },
 ];
 
 function ensureProj4Defs() {
@@ -2451,7 +2478,7 @@ function projectToWgs84(yOrLat, xOrLon, crsCode) {
   }
   ensureProj4Defs();
   if (typeof proj4 === 'undefined') {
-    throw new Error('proj4 not loaded — cannot convert CRS');
+    throw new Error(t('error.proj4Missing'));
   }
   // proj4 expects [x, y] = [easting/lon, northing/lat]
   const [lon, lat] = proj4(crsCode, 'EPSG:4326', [xOrLon, yOrLat]);
@@ -2475,8 +2502,8 @@ function renderMapView() {
   }
   const mv = state.mapView;
   const showUtm = mv.crs === 'UTM_N' || mv.crs === 'UTM_S';
-  const crsOpts = MAP_CRS_OPTIONS.map(o =>
-    `<option value="${o.id}" ${mv.crs === o.id ? 'selected' : ''}>${esc(o.label)}</option>`
+  const crsOpts = MAP_CRS_OPTIONS().map(o =>
+    `<option value="${o.id}" ${mv.crs === o.id ? 'selected' : ''}>${esc(t(o.labelKey))}</option>`
   ).join('');
   const statusText = mv.status || (mv.latCol && mv.lonCol ? '' : t('plotMap.pickCols'));
   return `<div class="plot-map-view">
@@ -2511,7 +2538,7 @@ function renderMapView() {
         <select id="map-crs">${crsOpts}</select>
       </div>
       ${showUtm ? `<div class="plot-map-field" style="min-width:6rem">
-        <label for="map-utm-zone">UTM zone</label>
+        <label for="map-utm-zone">${esc(t('plotMap.utmZone'))}</label>
         <input type="number" id="map-utm-zone" min="1" max="60" value="${esc(mv.utmZone || '')}" style="padding:.35rem .45rem;border:1px solid var(--border);border-radius:var(--radius);width:5rem" />
       </div>` : ''}
       <div class="plot-map-actions">
@@ -2715,7 +2742,7 @@ async function loadAndPlotMapPoints() {
   }
   const crsCode = resolveMapCrsCode();
   if (!crsCode) {
-    showError('Enter a valid UTM zone (1–60).');
+    showError(t('error.utmZoneInvalid'));
     return;
   }
   showLoading(t('plotMap.loading'));
@@ -2777,10 +2804,16 @@ function buildStandaloneMapHtml(points) {
   const symbolColJson = JSON.stringify(symbolCol);
   const defaultColor = JSON.stringify(MAP_SYMBOL_DEFAULT);
   const otherColor = JSON.stringify(MAP_SYMBOL_OTHER);
+  const layerStreet = JSON.stringify(t('plotMap.layerStreet'));
+  const layerTerrain = JSON.stringify(t('plotMap.layerTerrain'));
+  const layerSatellite = JSON.stringify(t('plotMap.layerSatellite'));
+  const symbolBlank = JSON.stringify(t('plotMap.symbolBlank'));
+  const symbolOtherLabel = JSON.stringify(t('plotMap.symbolOther'));
+  const htmlLang = appLocale();
   return `<!DOCTYPE html>
-<html lang="en"><head>
+<html lang="${htmlLang}"><head>
 <meta charset="UTF-8" />
-<title>GFB3 plot map</title>
+<title>${esc(t('plotMap.htmlTitle'))}</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"><\/script>
 <style>
@@ -2800,7 +2833,7 @@ const defaultColor = ${defaultColor};
 const otherColor = ${otherColor};
 function fillFor(sym) {
   if (!symbolCol) return defaultColor;
-  const key = (!sym || !String(sym).trim()) ? '(blank)' : String(sym);
+  const key = (!sym || !String(sym).trim()) ? ${symbolBlank} : String(sym);
   return colorMap[key] || otherColor;
 }
 const map = L.map('map');
@@ -2808,7 +2841,7 @@ const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
 const terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '© OpenTopoMap', maxZoom: 17 });
 const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: '© Esri', maxZoom: 19 });
 street.addTo(map);
-L.control.layers({ Street: street, Terrain: terrain, Satellite: satellite }).addTo(map);
+L.control.layers({ [${layerStreet}]: street, [${layerTerrain}]: terrain, [${layerSatellite}]: satellite }).addTo(map);
 const layer = L.geoJSON(data, {
   pointToLayer: (f, latlng) => L.circleMarker(latlng, {
     radius: 5, color: '#1b4332', weight: 1,
@@ -2833,7 +2866,7 @@ if (symbolCol && Object.keys(colorMap).length) {
       if (color === otherColor) {
         if (otherAdded) return;
         otherAdded = true;
-        text = 'Other';
+        text = ${symbolOtherLabel};
       }
       const row = document.createElement('div');
       row.className = 'plot-map-legend-row';
@@ -2862,7 +2895,7 @@ async function savePlotMapHtml() {
   const base = exportBaseName();
   const path = await saveDialog({
     defaultPath: `${base}_map.html`,
-    filters: [{ name: 'HTML', extensions: ['html'] }],
+    filters: [{ name: t('dialog.filterHtml'), extensions: ['html'] }],
   });
   if (!path) return;
   showLoading(t('plotMap.saving'));

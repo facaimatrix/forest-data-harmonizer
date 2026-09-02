@@ -10,7 +10,9 @@ use thiserror::Error;
 use crate::mapping::CensusType;
 use crate::schema::{STATUS_ALIVE, STATUS_DEAD, STATUS_RECRUIT};
 
-const UNIDENTIFIED_DEFAULT: &str = "Unidentified sp.";
+fn unidentified_default(locale: &str) -> String {
+    crate::i18n::unidentified_species(locale).to_string()
+}
 
 #[derive(Debug, Error)]
 pub enum DiagnosticError {
@@ -113,14 +115,8 @@ pub struct DiagnosticReport {
     pub html: String,
 }
 
-fn status_label(s: &str) -> &'static str {
-    match s {
-        "0" => "alive",
-        "1" => "dead between inventories",
-        "2" => "new recruit",
-        "9" => "missing",
-        _ => "unknown",
-    }
+fn status_label_for(locale: &str, s: &str) -> String {
+    crate::i18n::status_label(locale, s).to_string()
 }
 
 fn has_col(df: &DataFrame, name: &str) -> bool {
@@ -224,13 +220,14 @@ fn dbh_summary_from_vals(vals: &mut [f64]) -> DbhSummary {
     }
 }
 
-fn hist_svg(vals: &[f64], title: &str, n_bins: usize, width: u32, height: u32) -> String {
+fn hist_svg(vals: &[f64], title: &str, n_bins: usize, width: u32, height: u32, locale: &str) -> String {
     if vals.is_empty() {
         return format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><text x="12" y="24" fill="#5f7068">{title} — no data</text></svg>"##,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><text x="12" y="24" fill="#5f7068">{title}{no_data}</text></svg>"##,
             w = width,
             h = height,
-            title = title
+            title = title,
+            no_data = crate::i18n::chart_no_data(locale)
         );
     }
     let min_v = vals.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -288,13 +285,15 @@ fn bar_svg(
     width: u32,
     height: u32,
     hlines: &[(f64, &str)],
+    locale: &str,
 ) -> String {
     if labels.is_empty() {
         return format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><text x="12" y="24" fill="#5f7068">{title} — no data</text></svg>"##,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><text x="12" y="24" fill="#5f7068">{title}{no_data}</text></svg>"##,
             w = width,
             h = height,
-            title = title
+            title = title,
+            no_data = crate::i18n::chart_no_data(locale)
         );
     }
     let max_v = values
@@ -353,8 +352,13 @@ pub fn build_diagnostic_report(
     dataset_name: &str,
     curation_log: Option<&str>,
     unidentified_label: Option<&str>,
+    locale: &str,
 ) -> Result<DiagnosticReport, DiagnosticError> {
-    let unid = unidentified_label.unwrap_or(UNIDENTIFIED_DEFAULT);
+    use crate::i18n::{diagnostic_flag, diagnostic_label, diagnostic_skip_reason, diagnostic_verdict};
+
+    let unid = unidentified_label
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| unidentified_default(locale));
     let is_multi = census_type == CensusType::Multi;
     let n_rows = df.height() as u64;
 
@@ -425,7 +429,7 @@ pub fn build_diagnostic_report(
             let s = col_str(&st, "Status", i);
             let n = col_u64(&st, "n", i);
             status.push(StatusRow {
-                label: status_label(&s).to_string(),
+                label: status_label_for(locale, &s),
                 status: s,
                 n,
                 pct: (100.0 * n as f64 / total as f64 * 10.0).round() / 10.0,
@@ -479,7 +483,7 @@ pub fn build_diagnostic_report(
         }
         if has_col(df, "Species") {
             let sp = col_str(df, "Species", i);
-            if species_malformed(&sp, unid) {
+            if species_malformed(&sp, &unid) {
                 n_missing_species_trees.insert(tree.clone());
             }
         } else {
@@ -636,11 +640,11 @@ pub fn build_diagnostic_report(
     // BA / TPH (manual aggregation — robust across dtypes; single + multi)
     let mut ba: Vec<BaRow> = Vec::new();
     let mut tph: Vec<TphRow> = Vec::new();
-    let mut ba_skip_reason: Option<&'static str> = None;
+    let mut ba_skip_reason: Option<String> = None;
     if !has_col(df, "DBH") {
-        ba_skip_reason = Some("DBH column missing");
+        ba_skip_reason = Some(diagnostic_skip_reason(locale, "dbh_missing"));
     } else if !has_col(df, "PA") {
-        ba_skip_reason = Some("PA (plot area, ha) not mapped — assign a column or constant in Field assignment");
+        ba_skip_reason = Some(diagnostic_skip_reason(locale, "pa_missing"));
     } else {
         let mut map: std::collections::BTreeMap<(String, i64), (f64, f64, u64, f64)> =
             std::collections::BTreeMap::new();
@@ -679,9 +683,9 @@ pub fn build_diagnostic_report(
         }
         if map.is_empty() {
             ba_skip_reason = Some(if n_alive_with_dbh == 0 {
-                "no alive stems with valid DBH and PA > 0"
+                diagnostic_skip_reason(locale, "no_alive_dbh")
             } else {
-                "could not aggregate BA/TPH"
+                diagnostic_skip_reason(locale, "ba_aggregate_fail")
             });
         }
         for ((plot, _), (ba_sum, pa, n, yr)) in map {
@@ -726,7 +730,7 @@ pub fn build_diagnostic_report(
         }
         if has_col(df, "Species") {
             let sp = col_str(df, "Species", i);
-            if species_malformed(&sp, unid) {
+            if species_malformed(&sp, &unid) {
                 na_sp_map.entry(plot.clone()).or_default().insert(tree.clone());
             }
             if !unid.is_empty() && sp == unid {
@@ -783,37 +787,37 @@ pub fn build_diagnostic_report(
 
     let mut flags = vec![
         FlagRow {
-            flag: "Missing YR".into(),
+            flag: diagnostic_flag(locale, "missing_yr"),
             count: n_missing_yr as f64,
             severity: "critical".into(),
         },
         FlagRow {
-            flag: "Missing DBH (dead trees excluded)".into(),
+            flag: diagnostic_flag(locale, "missing_dbh"),
             count: n_missing_dbh as f64,
             severity: "warning".into(),
         },
         FlagRow {
-            flag: "Missing/malformed Species".into(),
+            flag: diagnostic_flag(locale, "missing_species"),
             count: n_missing_species_trees.len() as f64,
             severity: "warning".into(),
         },
         FlagRow {
-            flag: "DBH < 10 cm".into(),
+            flag: diagnostic_flag(locale, "dbh_small"),
             count: n_small as f64,
             severity: "warning".into(),
         },
         FlagRow {
-            flag: "Duplicate TreeID × YR".into(),
+            flag: diagnostic_flag(locale, "duplicate"),
             count: n_dups as f64,
             severity: "critical".into(),
         },
         FlagRow {
-            flag: "BA 51–100 m²/ha (higher than typical)".into(),
+            flag: diagnostic_flag(locale, "ba_warning"),
             count: n_ba_warning as f64,
             severity: "warning".into(),
         },
         FlagRow {
-            flag: "BA ≥ 100 m²/ha (implausible)".into(),
+            flag: diagnostic_flag(locale, "ba_critical"),
             count: n_ba_critical as f64,
             severity: "critical".into(),
         },
@@ -821,47 +825,47 @@ pub fn build_diagnostic_report(
     if is_multi {
         flags.extend([
             FlagRow {
-                flag: "Missing PrevDBH (recruits excluded)".into(),
+                flag: diagnostic_flag(locale, "missing_prevdbh"),
                 count: n_missing_prevdbh as f64,
                 severity: "info".into(),
             },
             FlagRow {
-                flag: "Negative DBH growth (%)".into(),
+                flag: diagnostic_flag(locale, "growth_negative"),
                 count: pct_neg,
                 severity: "warning".into(),
             },
             FlagRow {
-                flag: "Zero DBH growth".into(),
+                flag: diagnostic_flag(locale, "growth_zero"),
                 count: n_zero_growth as f64,
                 severity: "info".into(),
             },
             FlagRow {
-                flag: "Annual growth > 5 cm/yr".into(),
+                flag: diagnostic_flag(locale, "growth_fast"),
                 count: n_fast as f64,
                 severity: "warning".into(),
             },
             FlagRow {
-                flag: "Zombie trees (alive after death)".into(),
+                flag: diagnostic_flag(locale, "zombie"),
                 count: n_zombie as f64,
                 severity: "critical".into(),
             },
             FlagRow {
-                flag: "PrevDBH value mismatches lag(DBH)".into(),
+                flag: diagnostic_flag(locale, "prevdbh_mismatch"),
                 count: n_prevdbh_mismatch as f64,
                 severity: "critical".into(),
             },
             FlagRow {
-                flag: "PrevYR value mismatches lag(YR)".into(),
+                flag: diagnostic_flag(locale, "prevyear_mismatch"),
                 count: n_prevyr_mismatch as f64,
                 severity: "critical".into(),
             },
             FlagRow {
-                flag: "PrevDBH missing but valid lag(DBH) exists (alive)".into(),
+                flag: diagnostic_flag(locale, "prevdbh_orphan"),
                 count: n_prevdbh_orphan as f64,
                 severity: "critical".into(),
             },
             FlagRow {
-                flag: "PrevYR missing but valid lag(YR) exists (alive)".into(),
+                flag: diagnostic_flag(locale, "prevyear_orphan"),
                 count: n_prevyr_orphan as f64,
                 severity: "critical".into(),
             },
@@ -877,22 +881,14 @@ pub fn build_diagnostic_report(
         + n_prevdbh_orphan
         + n_prevyr_orphan;
     let soft = n_missing_dbh + n_small + n_fast + n_ba_warning + if pct_neg > 0.0 { 1 } else { 0 };
-    let (verdict, verdict_level) = if hard > 0 {
-        (
-            "FAIL: critical issues must be resolved before use.".to_string(),
-            "fail".to_string(),
-        )
+    let verdict_level = if hard > 0 {
+        "fail".to_string()
     } else if soft > 0 {
-        (
-            "WARN: passed critical checks but has warnings worth reviewing.".to_string(),
-            "warn".to_string(),
-        )
+        "warn".to_string()
     } else {
-        (
-            "PASS: dataset looks clean.".to_string(),
-            "pass".to_string(),
-        )
+        "pass".to_string()
     };
+    let verdict = diagnostic_verdict(locale, &verdict_level);
 
     // Charts
     let mut dbh_hist_vals: Vec<f64> = Vec::new();
@@ -901,9 +897,23 @@ pub fn build_diagnostic_report(
             dbh_hist_vals.push(d);
         }
     }
-    let dbh_hist_svg = hist_svg(&dbh_hist_vals, "DBH distribution (cm)", 20, 640, 280);
+    let dbh_hist_svg = hist_svg(
+        &dbh_hist_vals,
+        &diagnostic_label(locale, "chart_dbh_hist"),
+        20,
+        640,
+        280,
+        locale,
+    );
     let growth_hist_svg = if is_multi && !growth_deltas.is_empty() {
-        Some(hist_svg(&growth_deltas, "DBH growth Δ (cm)", 20, 640, 280))
+        Some(hist_svg(
+            &growth_deltas,
+            &diagnostic_label(locale, "chart_growth_hist"),
+            20,
+            640,
+            280,
+            locale,
+        ))
     } else {
         None
     };
@@ -929,10 +939,11 @@ pub fn build_diagnostic_report(
             _ => "#4DAF7C".into(),
         })
         .collect();
-    let ba_empty_msg = ba_skip_reason.unwrap_or("no data");
+    let ba_empty_msg = ba_skip_reason.unwrap_or_else(|| diagnostic_skip_reason(locale, "no_data"));
     let ba_bar_svg = if ba_sorted.is_empty() {
         format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="80"><text x="12" y="28" fill="#5f7068" font-family="system-ui,sans-serif" font-size="13">Basal area — {msg}</text></svg>"##,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="80"><text x="12" y="28" fill="#5f7068" font-family="system-ui,sans-serif" font-size="13">{ba_label} — {msg}</text></svg>"##,
+            ba_label = diagnostic_label(locale, "basal_area"),
             msg = ba_empty_msg
         )
     } else {
@@ -940,11 +951,12 @@ pub fn build_diagnostic_report(
             &ba_labels,
             &ba_vals,
             &ba_cols,
-            "Basal area by plot × census",
-            "BA (m²/ha)",
+            &diagnostic_label(locale, "chart_ba_by_plot"),
+            &diagnostic_label(locale, "chart_ba_ylabel"),
             720,
             320,
             &[(50.0, "#F5A623"), (100.0, "#E84855")],
+            locale,
         )
     };
 
@@ -963,7 +975,8 @@ pub fn build_diagnostic_report(
     let tph_cols: Vec<String> = vec!["#4DAF7C".into(); tph_vals.len()];
     let tph_bar_svg = if tph_sorted.is_empty() {
         format!(
-            r##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="80"><text x="12" y="28" fill="#5f7068" font-family="system-ui,sans-serif" font-size="13">TPH — {msg}</text></svg>"##,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="720" height="80"><text x="12" y="28" fill="#5f7068" font-family="system-ui,sans-serif" font-size="13">{tph_label} — {msg}</text></svg>"##,
+            tph_label = diagnostic_label(locale, "tph"),
             msg = ba_empty_msg
         )
     } else {
@@ -971,11 +984,12 @@ pub fn build_diagnostic_report(
             &tph_labels,
             &tph_vals,
             &tph_cols,
-            "Trees per hectare by plot × census",
-            "TPH",
+            &diagnostic_label(locale, "chart_tph_by_plot"),
+            &diagnostic_label(locale, "chart_tph_ylabel"),
             720,
             320,
             &[],
+            locale,
         )
     };
 
@@ -1009,7 +1023,7 @@ pub fn build_diagnostic_report(
         curation_log: curation_log.map(|s| s.to_string()),
         html: String::new(),
     };
-    report.html = render_report_html(&report);
+    report.html = render_report_html(&report, locale);
     Ok(report)
 }
 
@@ -1020,11 +1034,13 @@ fn esc_html(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn render_report_html(r: &DiagnosticReport) -> String {
+fn render_report_html(r: &DiagnosticReport, locale: &str) -> String {
+    use crate::i18n::{diagnostic_label, severity_label};
+
     let title = if r.census_type == "multi" {
-        "GFB3 Format Diagnostic Report"
+        diagnostic_label(locale, "title_multi")
     } else {
-        "GFB2 / Single-census Diagnostic Report"
+        diagnostic_label(locale, "title_single")
     };
     let yr = match (r.yr_min, r.yr_max) {
         (Some(a), Some(b)) => format!("{a:.0} – {b:.0}"),
@@ -1054,35 +1070,46 @@ fn render_report_html(r: &DiagnosticReport) -> String {
             esc_html(&f.severity),
             esc_html(&f.flag),
             f.count,
-            esc_html(&f.severity)
+            esc_html(&severity_label(locale, &f.severity))
         ));
     }
 
     let growth_html = if let Some(g) = &r.growth {
         let chart = r.charts.growth_hist_svg.clone().unwrap_or_default();
         format!(
-            r#"<h3>Growth summary</h3>
+            r#"<h3>{}</h3>
             <ul>
-              <li>Paired alive stems: {}</li>
-              <li>Mean ΔDBH: {}</li>
-              <li>Mean annual growth: {}</li>
-              <li>Negative growth: {}%</li>
-              <li>Zero growth: {}</li>
-              <li>Annual &gt; 5 cm/yr: {}</li>
+              <li>{}: {}</li>
+              <li>{}: {}</li>
+              <li>{}: {}</li>
+              <li>{}: {}%</li>
+              <li>{}: {}</li>
+              <li>{}: {}</li>
             </ul>
             {}"#,
+            diagnostic_label(locale, "growth_summary"),
+            diagnostic_label(locale, "growth_paired"),
             g.n,
+            diagnostic_label(locale, "growth_mean_delta"),
             g.mean_delta.map(|x| format!("{x:.3} cm")).unwrap_or_else(|| "—".into()),
+            diagnostic_label(locale, "growth_mean_annual"),
             g.mean_annual
                 .map(|x| format!("{x:.3} cm/yr"))
                 .unwrap_or_else(|| "—".into()),
+            diagnostic_label(locale, "growth_pct_neg"),
             g.pct_negative,
+            diagnostic_label(locale, "growth_zero"),
             g.n_zero,
+            diagnostic_label(locale, "growth_fast"),
             g.n_fast,
             chart
         )
     } else {
-        "<h3>Growth summary</h3><p class=\"muted\">Not applicable for single-census (GFB2) data.</p>"
+        format!(
+            "<h3>{}</h3><p class=\"muted\">{}</p>",
+            diagnostic_label(locale, "growth_summary"),
+            diagnostic_label(locale, "growth_na")
+        )
             .into()
     };
 
@@ -1092,7 +1119,8 @@ fn render_report_html(r: &DiagnosticReport) -> String {
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             format!(
-                "<h3>Curation notes</h3><pre class=\"curation\">{}</pre>",
+                "<h3>{}</h3><pre class=\"curation\">{}</pre>",
+                diagnostic_label(locale, "curation_notes"),
                 esc_html(s)
             )
         })
@@ -1102,43 +1130,65 @@ fn render_report_html(r: &DiagnosticReport) -> String {
         r#"<div class="diag-report">
   <h2>{title}</h2>
   <div class="diag-verdict {verdict_cls}">{verdict}</div>
-  <h3>Overview</h3>
+  <h3>{overview}</h3>
   <ul>
-    <li>Dataset: <code>{dsn}</code></li>
-    <li>Mode: {mode}</li>
-    <li>Rows: {rows}</li>
-    <li>Trees: {trees}</li>
-    <li>Plots: {plots}</li>
-    <li>Year range: {yr}</li>
+    <li>{lbl_dataset}: <code>{dsn}</code></li>
+    <li>{lbl_mode}: {mode}</li>
+    <li>{lbl_rows}: {rows}</li>
+    <li>{lbl_trees}: {trees}</li>
+    <li>{lbl_plots}: {plots}</li>
+    <li>{lbl_year_range}: {yr}</li>
   </ul>
   {curation}
-  <h3>Status distribution</h3>
-  <table class="diag-table"><thead><tr><th>Status</th><th>Label</th><th>n</th><th>%</th></tr></thead>
+  <h3>{status_distribution}</h3>
+  <table class="diag-table"><thead><tr><th>{th_status}</th><th>{th_label}</th><th>{th_n}</th><th>{th_pct}</th></tr></thead>
   <tbody>{status_rows}</tbody></table>
-  <h3>DBH summary</h3>
+  <h3>{dbh_summary}</h3>
   <ul>
-    <li>n: {dn}</li>
-    <li>mean ± sd: {dmean} ± {dsd} cm</li>
-    <li>min / Q25 / median / Q75 / max: {dmin} / {dq25} / {dmed} / {dq75} / {dmax}</li>
+    <li>{lbl_dbh_n}: {dn}</li>
+    <li>{lbl_dbh_mean_sd}: {dmean} ± {dsd} cm</li>
+    <li>{lbl_dbh_quantiles}: {dmin} / {dq25} / {dmed} / {dq75} / {dmax}</li>
   </ul>
   {dbh_chart}
   {growth_html}
-  <h3>Basal area</h3>
+  <h3>{basal_area}</h3>
   {ba_chart}
-  <h3>Trees per hectare</h3>
+  <h3>{tph}</h3>
   {tph_chart}
-  <h3>Data quality flags</h3>
-  <table class="diag-table"><thead><tr><th>Flag</th><th>Count</th><th>Severity</th></tr></thead>
+  <h3>{flags}</h3>
+  <table class="diag-table"><thead><tr><th>{th_flag}</th><th>{th_count}</th><th>{th_severity}</th></tr></thead>
   <tbody>{flag_rows}</tbody></table>
 </div>"#,
         title = title,
+        overview = diagnostic_label(locale, "overview"),
+        lbl_dataset = diagnostic_label(locale, "dataset"),
+        lbl_mode = diagnostic_label(locale, "mode"),
+        lbl_rows = diagnostic_label(locale, "rows"),
+        lbl_trees = diagnostic_label(locale, "trees"),
+        lbl_plots = diagnostic_label(locale, "plots"),
+        lbl_year_range = diagnostic_label(locale, "year_range"),
+        lbl_dbh_n = diagnostic_label(locale, "dbh_n"),
+        lbl_dbh_mean_sd = diagnostic_label(locale, "dbh_mean_sd"),
+        lbl_dbh_quantiles = diagnostic_label(locale, "dbh_quantiles"),
+        th_status = diagnostic_label(locale, "th_status"),
+        th_label = diagnostic_label(locale, "th_label"),
+        th_n = diagnostic_label(locale, "th_n"),
+        th_pct = diagnostic_label(locale, "th_pct"),
+        th_flag = diagnostic_label(locale, "th_flag"),
+        th_count = diagnostic_label(locale, "th_count"),
+        th_severity = diagnostic_label(locale, "th_severity"),
+        status_distribution = diagnostic_label(locale, "status_distribution"),
+        dbh_summary = diagnostic_label(locale, "dbh_summary"),
+        basal_area = diagnostic_label(locale, "basal_area"),
+        tph = diagnostic_label(locale, "tph"),
+        flags = diagnostic_label(locale, "flags"),
         verdict_cls = verdict_cls,
         verdict = esc_html(&r.verdict),
         dsn = esc_html(&r.dataset_name),
         mode = if r.census_type == "multi" {
-            "Multi-census (GFB3)"
+            diagnostic_label(locale, "mode_multi")
         } else {
-            "Single-census (GFB2)"
+            diagnostic_label(locale, "mode_single")
         },
         rows = r.n_rows,
         trees = r.n_trees,
@@ -1190,12 +1240,21 @@ pub fn write_diagnostic_html(report: &DiagnosticReport, path: &std::path::Path) 
 }
 
 /// Write a simple text-based PDF of the diagnostic summary (tables + verdict).
-pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -> Result<(), String> {
+pub fn write_diagnostic_pdf(
+    report: &DiagnosticReport,
+    path: &std::path::Path,
+    locale: &str,
+) -> Result<(), String> {
+    use crate::i18n::diagnostic_label;
     use printpdf::*;
     use std::io::BufWriter;
 
     let (doc, page1, layer1) = PdfDocument::new(
-        format!("Diagnostic - {}", report.dataset_name),
+        format!(
+            "{} - {}",
+            diagnostic_label(locale, "pdf_diagnostic"),
+            report.dataset_name
+        ),
         Mm(210.0),
         Mm(297.0),
         "Layer 1",
@@ -1214,34 +1273,48 @@ pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -
     lines.push((
         true,
         if report.census_type == "multi" {
-            "GFB3 Format Diagnostic Report".into()
+            diagnostic_label(locale, "title_multi")
         } else {
-            "GFB2 / Single-census Diagnostic Report".into()
+            diagnostic_label(locale, "title_single")
         },
     ));
-    lines.push((false, format!("Dataset: {}", report.dataset_name)));
     lines.push((
         false,
         format!(
-            "Mode: {}",
+            "{}: {}",
+            diagnostic_label(locale, "dataset"),
+            report.dataset_name
+        ),
+    ));
+    lines.push((
+        false,
+        format!(
+            "{}: {}",
+            diagnostic_label(locale, "mode"),
             if report.census_type == "multi" {
-                "Multi-census (GFB3)"
+                diagnostic_label(locale, "mode_multi")
             } else {
-                "Single-census (GFB2)"
+                diagnostic_label(locale, "mode_single")
             }
         ),
     ));
     lines.push((
         false,
         format!(
-            "Rows: {}   Trees: {}   Plots: {}",
-            report.n_rows, report.n_trees, report.n_plots
+            "{}: {}   {}: {}   {}: {}",
+            diagnostic_label(locale, "rows"),
+            report.n_rows,
+            diagnostic_label(locale, "trees"),
+            report.n_trees,
+            diagnostic_label(locale, "plots"),
+            report.n_plots
         ),
     ));
     lines.push((
         false,
         format!(
-            "Year range: {} - {}",
+            "{}: {} - {}",
+            diagnostic_label(locale, "year_range"),
             report
                 .yr_min
                 .map(|x| format!("{x:.0}"))
@@ -1253,9 +1326,19 @@ pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -
         ),
     ));
     lines.push((false, String::new()));
-    lines.push((true, format!("VERDICT: {}", report.verdict)));
+    lines.push((
+        true,
+        format!(
+            "{}: {}",
+            diagnostic_label(locale, "verdict_heading"),
+            report.verdict
+        ),
+    ));
     lines.push((false, String::new()));
-    lines.push((true, "Status distribution:".into()));
+    lines.push((
+        true,
+        format!("{}:", diagnostic_label(locale, "status_distribution")),
+    ));
     for s in &report.status {
         lines.push((
             false,
@@ -1263,7 +1346,10 @@ pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -
         ));
     }
     lines.push((false, String::new()));
-    lines.push((true, "Data quality flags:".into()));
+    lines.push((
+        true,
+        format!("{}:", diagnostic_label(locale, "flags")),
+    ));
     for f in &report.flags {
         lines.push((
             false,
@@ -1274,16 +1360,23 @@ pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -
     lines.push((
         false,
         format!(
-            "DBH: n={} mean={:?} median={:?}",
-            report.dbh.n, report.dbh.mean, report.dbh.median
+            "{}: n={} mean={:?} median={:?}",
+            diagnostic_label(locale, "dbh_summary"),
+            report.dbh.n,
+            report.dbh.mean,
+            report.dbh.median
         ),
     ));
     if let Some(g) = &report.growth {
         lines.push((
             false,
             format!(
-                "Growth: n={} mean_delta={:?} pct_neg={} fast={}",
-                g.n, g.mean_delta, g.pct_negative, g.n_fast
+                "{}: n={} mean_delta={:?} pct_neg={} fast={}",
+                diagnostic_label(locale, "growth_summary"),
+                g.n,
+                g.mean_delta,
+                g.pct_negative,
+                g.n_fast
             ),
         ));
     }
@@ -1291,7 +1384,8 @@ pub fn write_diagnostic_pdf(report: &DiagnosticReport, path: &std::path::Path) -
     lines.push((
         true,
         format!(
-            "BA rows: {} (warning={}, critical={})",
+            "{}: {} (warning={}, critical={})",
+            diagnostic_label(locale, "basal_area"),
             report.ba.len(),
             report.ba.iter().filter(|b| b.ba_flag == "warning").count(),
             report.ba.iter().filter(|b| b.ba_flag == "critical").count()

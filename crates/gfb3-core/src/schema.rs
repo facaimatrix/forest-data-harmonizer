@@ -270,6 +270,48 @@ pub enum GateError {
     MultipleAllNullColumns { count: usize },
 }
 
+/// Structured gate error for frontend localization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateErrorItem {
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
+}
+
+impl GateError {
+    pub fn item(&self) -> GateErrorItem {
+        match self {
+            GateError::Empty => GateErrorItem {
+                code: "empty".into(),
+                name: None,
+                count: None,
+            },
+            GateError::DuplicateColumnName { name } => GateErrorItem {
+                code: "duplicateColumn".into(),
+                name: Some(name.clone()),
+                count: None,
+            },
+            GateError::BlankColumnName { name } => GateErrorItem {
+                code: "blankColumn".into(),
+                name: Some(name.clone()),
+                count: None,
+            },
+            GateError::AllNullColumn { name } => GateErrorItem {
+                code: "allNullColumn".into(),
+                name: Some(name.clone()),
+                count: None,
+            },
+            GateError::MultipleAllNullColumns { count } => GateErrorItem {
+                code: "multipleAllNull".into(),
+                name: None,
+                count: Some(*count),
+            },
+        }
+    }
+}
+
 impl InputGate {
     /// Runs all structural checks against a loaded `DataFrame`.
     /// Returns every error found (not short-circuit), so the user sees all

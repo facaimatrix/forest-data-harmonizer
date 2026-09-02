@@ -14,7 +14,7 @@ use gfb3_core::mapping::{
 use gfb3_core::reader::{dataframe_preview, read_file};
 use gfb3_core::schema::{
     gfb2_export_columns, gfb3_export_columns, select_export_columns, with_expan, with_plot_yr,
-    ExpanSpec, Gfb3Field, InputGate,
+    ExpanSpec, GateErrorItem, Gfb3Field, InputGate,
 };
 use gfb3_core::summary::{build_dataset_summary, build_plots_summary};
 use gfb3_core::tnrs::{
@@ -46,7 +46,7 @@ pub struct LoadResult {
     /// First 5 rows, row-major, values as strings (nulls → null in JSON).
     pub preview_rows: Vec<Vec<Option<String>>>,
     /// Plain-language structural gate errors (empty = passed).
-    pub gate_errors: Vec<String>,
+    pub gate_errors: Vec<GateErrorItem>,
     /// Fuzzy-suggested column mappings for the mapping step.
     pub suggested_mappings: Vec<SuggestedMapping>,
 }
@@ -66,9 +66,9 @@ pub async fn load_file(
     let file_path = std::path::Path::new(&path);
     let df = read_file(file_path).map_err(|e| e.to_string())?;
 
-    let gate_errors: Vec<String> = InputGate::check(&df)
+    let gate_errors: Vec<GateErrorItem> = InputGate::check(&df)
         .into_iter()
-        .map(|e| e.to_string())
+        .map(|e| e.item())
         .collect();
 
     let columns: Vec<String> = df
@@ -380,6 +380,7 @@ pub struct ValidateStepResult {
 #[command]
 pub async fn run_validation(
     state: tauri::State<'_, AppState>,
+    locale: Option<String>,
 ) -> Result<ValidateStepResult, String> {
     let mut guard = state.session.lock().unwrap();
     let session = guard.as_mut().ok_or("no file loaded")?;
@@ -424,8 +425,15 @@ pub async fn run_validation(
     )
     .map_err(|e| e.to_string())?;
 
-    let diagnostic = build_diagnostic_report(df, census_type, &dataset_name, None, None)
-        .map_err(|e| e.to_string())?;
+    let diagnostic = build_diagnostic_report(
+        df,
+        census_type,
+        &dataset_name,
+        None,
+        None,
+        locale.as_deref().unwrap_or("en"),
+    )
+    .map_err(|e| e.to_string())?;
 
     session.validation_report = Some(report.clone());
     session.diagnostic_report = Some(diagnostic.clone());
@@ -440,6 +448,9 @@ pub struct DiagnosticExportRequest {
     pub path: String,
     /// "pdf" | "html"
     pub format: String,
+    /// UI locale for PDF text (en / es / pt).
+    #[serde(default)]
+    pub locale: String,
 }
 
 #[command]
@@ -461,8 +472,14 @@ pub async fn export_diagnostic_report(
         }
     }
 
+    let locale = if request.locale.trim().is_empty() {
+        "en"
+    } else {
+        request.locale.trim()
+    };
+
     match request.format.as_str() {
-        "pdf" => write_diagnostic_pdf(report, path)?,
+        "pdf" => write_diagnostic_pdf(report, path, locale)?,
         "html" => write_diagnostic_html(report, path).map_err(|e| e.to_string())?,
         other => return Err(format!("unsupported diagnostic export format: {other}")),
     }
@@ -491,6 +508,9 @@ pub struct ExportRequest {
     /// Curator of record for the curation-log skeleton.
     #[serde(default)]
     pub curator: String,
+    /// UI locale for exported curation log (en / es / pt).
+    #[serde(default)]
+    pub locale: String,
 }
 
 fn default_true() -> bool {
@@ -724,7 +744,12 @@ pub async fn export(
         log.append_escalated_findings(&report.findings);
     }
     let log_path = out_dir.join(format!("{}_curation_log.txt", request.base_name));
-    std::fs::write(&log_path, log.render()).map_err(|e| e.to_string())?;
+    let loc = if request.locale.trim().is_empty() {
+        "en"
+    } else {
+        request.locale.trim()
+    };
+    std::fs::write(&log_path, log.render_with_locale(loc)).map_err(|e| e.to_string())?;
     written.push(log_path.to_string_lossy().into_owned());
 
     Ok(written)

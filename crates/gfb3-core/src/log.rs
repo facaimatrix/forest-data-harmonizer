@@ -58,6 +58,13 @@ impl CurationLog {
 
     /// Render to the fixed plain-text template format.
     pub fn render(&self) -> String {
+        self.render_with_locale("en")
+    }
+
+    /// Render with localized section headers (en / es / pt).
+    pub fn render_with_locale(&self, locale: &str) -> String {
+        use crate::i18n::curation_label;
+
         let mut out = String::new();
 
         fn opt(v: &Option<String>) -> &str {
@@ -71,32 +78,48 @@ impl CurationLog {
             }
         }
 
-        out.push_str(&format!("DATASET: {}\n", opt(&self.dataset)));
-        out.push_str(&format!("COUNTRY: {}\n", opt(&self.country)));
-        out.push_str(&format!("SITE: {}\n", opt(&self.site)));
-        out.push_str(&format!("PI: {}\n", opt(&self.pi)));
-        out.push_str(&format!("CURATOR: {}\n", self.curator));
-        out.push_str(&format!("DATE RECEIVED: {}\n", opt(&self.date_received)));
-        out.push_str(&format!("DATE PROCESSED: {}\n", opt(&self.date_processed)));
-        out.push_str("--- SOURCE FORMAT ---\n");
+        out.push_str(&format!(
+            "{} {}\n",
+            curation_label(locale, "dataset"),
+            opt(&self.dataset)
+        ));
+        out.push_str(&format!(
+            "{} {}\n",
+            curation_label(locale, "country"),
+            opt(&self.country)
+        ));
+        out.push_str(&format!("{} {}\n", curation_label(locale, "site"), opt(&self.site)));
+        out.push_str(&format!("{} {}\n", curation_label(locale, "pi"), opt(&self.pi)));
+        out.push_str(&format!("{} {}\n", curation_label(locale, "curator"), self.curator));
+        out.push_str(&format!(
+            "{} {}\n",
+            curation_label(locale, "date_received"),
+            opt(&self.date_received)
+        ));
+        out.push_str(&format!(
+            "{} {}\n",
+            curation_label(locale, "date_processed"),
+            opt(&self.date_processed)
+        ));
+        out.push_str(&format!("{}\n", curation_label(locale, "source")));
         out.push_str(&lines(&self.source_format));
         out.push('\n');
-        out.push_str("--- PIVOT / RESTRUCTURING ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "pivot")));
         out.push_str(&lines(&self.pivot_restructuring));
         out.push('\n');
-        out.push_str("--- DUPLICATE RESOLUTION ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "duplicate")));
         out.push_str(&lines(&self.duplicate_resolution));
         out.push('\n');
-        out.push_str("--- MISSING / INTERPOLATED DATA ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "missing")));
         out.push_str(&lines(&self.missing_interpolated));
         out.push('\n');
-        out.push_str("--- SPECIES ISSUES ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "species")));
         out.push_str(&lines(&self.species_issues));
         out.push('\n');
-        out.push_str("--- EXCLUSIONS ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "exclusions")));
         out.push_str(&lines(&self.exclusions));
         out.push('\n');
-        out.push_str("--- NOTES ---\n");
+        out.push_str(&format!("{}\n", curation_label(locale, "notes")));
         out.push_str(&lines(&self.notes));
         out.push('\n');
 
