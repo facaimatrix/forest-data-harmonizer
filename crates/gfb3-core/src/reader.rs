@@ -154,7 +154,12 @@ pub fn read_xlsx(path: &Path) -> Result<DataFrame, ReadError> {
     DataFrame::new(cols).map_err(ReadError::Polars)
 }
 
-/// Read a CSV/TSV file into a DataFrame using Polars schema inference.
+/// Read a CSV/TSV file into a DataFrame.
+///
+/// All columns are read as strings (`infer_schema_length = 0`), matching the
+/// XLSX path. Polars' default 100-row inference otherwise treats early numeric
+/// Status codes as `i64` and fails when later rows contain labels like `"snag"`.
+/// Semantic casting happens in the mapping / transform steps.
 pub fn read_csv(path: &Path) -> Result<DataFrame, ReadError> {
     let sep = if path.extension().and_then(|e| e.to_str()) == Some("tsv") {
         b'\t'
@@ -163,7 +168,7 @@ pub fn read_csv(path: &Path) -> Result<DataFrame, ReadError> {
     };
 
     CsvReadOptions::default()
-        .with_infer_schema_length(Some(100))
+        .with_infer_schema_length(Some(0))
         .with_has_header(true)
         .map_parse_options(|opts| opts.with_separator(sep))
         .try_into_reader_with_file_path(Some(path.to_path_buf()))
@@ -205,7 +210,7 @@ pub fn dataframe_preview(df: &DataFrame, n_rows: usize) -> Vec<Vec<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use polars::prelude::*;
+    use std::io::Write;
 
     #[test]
     fn normalize_drops_all_null_and_blank_headers() {
@@ -219,5 +224,25 @@ mod tests {
         assert_eq!(out.width(), 2);
         assert!(out.get_column_names().iter().any(|n| n.as_str() == "PlotID"));
         assert!(out.get_column_names().iter().any(|n| n.as_str() == "DBH"));
+    }
+
+    #[test]
+    fn csv_reads_mixed_status_labels_as_string() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("gfb3_status_snag_test.csv");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "PlotID,TreeID,YR,DBH,Status\nP1,T1,2010,12.5,0\nP1,T2,2010,8.1,1\nP1,T3,2010,,snag"
+            )
+            .unwrap();
+        }
+        let df = read_csv(&path).expect("csv with late string Status should load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(df.height(), 3);
+        let status = df.column("Status").unwrap();
+        assert_eq!(status.dtype(), &DataType::String);
+        assert_eq!(status.str().unwrap().get(2), Some("snag"));
     }
 }
