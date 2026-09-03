@@ -337,17 +337,9 @@ fn status_vocab_counts(
             AnyValue::Null => continue,
             AnyValue::String(s) => s.to_string(),
             AnyValue::StringOwned(s) => s.to_string(),
-            other => {
-                let t = other.to_string();
-                // Strip Polars quoting like "alive" → alive
-                if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-                    t[1..t.len() - 1].to_string()
-                } else {
-                    t
-                }
-            }
+            other => other.str_value().into_owned(),
         };
-        if s.trim().is_empty() {
+        if s.trim().is_empty() || s == "null" {
             continue;
         }
         *counts.entry(s).or_insert(0) += 1;
@@ -1157,8 +1149,8 @@ pub async fn resolve_species_tnrs(
         if matches!(val, AnyValue::Null) {
             continue;
         }
-        let s = val.to_string();
-        if s.trim().is_empty() {
+        let s = val.str_value().into_owned();
+        if s.trim().is_empty() || s == "null" {
             continue;
         }
         *counts.entry(s).or_insert(0) += 1;

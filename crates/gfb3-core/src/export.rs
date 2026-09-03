@@ -201,20 +201,53 @@ fn write_any_value(
     col: u16,
     val: AnyValue<'_>,
 ) -> Result<(), ExportError> {
+    // Prefer typed writers. For strings use str_value() — AnyValue's Display
+    // wraps Utf8 values in quotes (e.g. `"alive"`), which would land in the cell.
     let r = match val {
-        AnyValue::Null       => return Ok(()),
+        AnyValue::Null => return Ok(()),
         AnyValue::Float64(v) => ws.write_number(row, col, v),
-        AnyValue::Float32(v) => ws.write_number(row, col, v as f64),
-        AnyValue::Int64(v)   => ws.write_number(row, col, v as f64),
-        AnyValue::Int32(v)   => ws.write_number(row, col, v as f64),
-        AnyValue::Int16(v)   => ws.write_number(row, col, v as f64),
-        AnyValue::Int8(v)    => ws.write_number(row, col, v as f64),
-        AnyValue::UInt64(v)  => ws.write_number(row, col, v as f64),
-        AnyValue::UInt32(v)  => ws.write_number(row, col, v as f64),
-        AnyValue::UInt16(v)  => ws.write_number(row, col, v as f64),
-        AnyValue::UInt8(v)   => ws.write_number(row, col, v as f64),
+        AnyValue::Float32(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::Int64(v) => ws.write_number(row, col, v as f64),
+        AnyValue::Int32(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::Int16(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::Int8(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::UInt64(v) => ws.write_number(row, col, v as f64),
+        AnyValue::UInt32(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::UInt16(v) => ws.write_number(row, col, f64::from(v)),
+        AnyValue::UInt8(v) => ws.write_number(row, col, f64::from(v)),
         AnyValue::Boolean(v) => ws.write_boolean(row, col, v),
-        other                => ws.write_string(row, col, &other.to_string()),
+        AnyValue::String(_) | AnyValue::StringOwned(_) => {
+            ws.write_string(row, col, val.str_value().as_ref())
+        }
+        other => ws.write_string(row, col, other.str_value().as_ref()),
     };
     r.map(|_| ()).map_err(|e| ExportError::Xlsx(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xlsx_string_cells_have_no_polars_display_quotes() {
+        use calamine::Reader;
+
+        let df = DataFrame::new(vec![
+            Column::from(Series::new("PlotID".into(), &["P1", "P2"])),
+            Column::from(Series::new("Status".into(), &["alive", "snag"])),
+        ])
+        .unwrap();
+        let path = std::env::temp_dir().join("gfb3_xlsx_quote_test.xlsx");
+        write_xlsx(df, &path, &Provenance::new_draft("test")).unwrap();
+
+        let mut wb = calamine::open_workbook_auto(&path).unwrap();
+        let range = wb.worksheet_range("data").unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let p1 = range.get((1, 0)).unwrap().to_string();
+        let alive = range.get((1, 1)).unwrap().to_string();
+        assert_eq!(p1, "P1", "PlotID cell should be bare P1, got {p1:?}");
+        assert_eq!(alive, "alive", "Status cell should be bare alive, got {alive:?}");
+        assert!(!p1.starts_with('"') && !alive.starts_with('"'));
+    }
 }

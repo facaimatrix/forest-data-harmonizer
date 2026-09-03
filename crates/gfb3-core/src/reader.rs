@@ -199,7 +199,14 @@ pub fn dataframe_preview(df: &DataFrame, n_rows: usize) -> Vec<Vec<Option<String
                     let av = col.get(i).unwrap_or(AnyValue::Null);
                     match av {
                         AnyValue::Null => None,
-                        other => Some(other.to_string()),
+                        other => {
+                            let s = other.str_value();
+                            if s == "null" {
+                                None
+                            } else {
+                                Some(s.into_owned())
+                            }
+                        }
                     }
                 })
                 .collect()
