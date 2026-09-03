@@ -1282,7 +1282,7 @@ pub async fn apply_species_resolutions(
 // Map tab: extract plot / tree coordinates from the loaded dataframe
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MapPoint {
     pub lat: f64,
     pub lon: f64,
@@ -1296,6 +1296,63 @@ pub struct MapPointsResult {
     pub points: Vec<MapPoint>,
     pub total_rows_scanned: usize,
     pub truncated: bool,
+}
+
+/// Thin a point cloud to `limit` by round-robin sampling across a geographic grid.
+/// Prefer this over "first N in file order" so later / distant plots still appear.
+fn subsample_spatially(points: Vec<MapPoint>, limit: usize) -> Vec<MapPoint> {
+    if points.len() <= limit {
+        return points;
+    }
+
+    let mut lat_min = f64::INFINITY;
+    let mut lat_max = f64::NEG_INFINITY;
+    let mut lon_min = f64::INFINITY;
+    let mut lon_max = f64::NEG_INFINITY;
+    for p in &points {
+        lat_min = lat_min.min(p.lat);
+        lat_max = lat_max.max(p.lat);
+        lon_min = lon_min.min(p.lon);
+        lon_max = lon_max.max(p.lon);
+    }
+    let lat_span = (lat_max - lat_min).max(1e-9);
+    let lon_span = (lon_max - lon_min).max(1e-9);
+    let side = ((limit as f64).sqrt().ceil() as usize).max(1);
+
+    let mut buckets: std::collections::HashMap<(usize, usize), Vec<MapPoint>> =
+        std::collections::HashMap::new();
+    for p in points {
+        let row = (((p.lat - lat_min) / lat_span) * side as f64).floor() as usize;
+        let col = (((p.lon - lon_min) / lon_span) * side as f64).floor() as usize;
+        buckets
+            .entry((row.min(side - 1), col.min(side - 1)))
+            .or_default()
+            .push(p);
+    }
+
+    // Larger cells first so dense regions don't starve sparse ones on early rounds.
+    let mut bucket_list: Vec<Vec<MapPoint>> = buckets.into_values().collect();
+    bucket_list.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let mut out = Vec::with_capacity(limit);
+    let mut depth = 0usize;
+    while out.len() < limit {
+        let mut progressed = false;
+        for bucket in &bucket_list {
+            if depth < bucket.len() {
+                out.push(bucket[depth].clone());
+                progressed = true;
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            break;
+        }
+        depth += 1;
+    }
+    out
 }
 
 fn anyvalue_to_f64(v: &AnyValue) -> Option<f64> {
@@ -1368,6 +1425,9 @@ pub async fn get_map_points(
     let df = &session.raw_df;
 
     let limit = max_points.unwrap_or(25_000).min(100_000);
+    // Collect more unique locations than we display so spatial thinning can
+    // draw from the whole file, not only the first rows.
+    let collect_cap = (limit.saturating_mul(4)).max(limit).min(100_000);
     let n = df.height();
     let lat_s = df.column(&lat_col).map_err(|_| {
         format!("Latitude column “{lat_col}” not found in the loaded file.")
@@ -1391,7 +1451,7 @@ pub async fn get_map_points(
 
     let mut seen = std::collections::HashSet::new();
     let mut points = Vec::new();
-    let mut truncated = false;
+    let mut hit_collect_cap = false;
 
     for i in 0..n {
         let lat = anyvalue_to_f64(&lat_s.get(i).map_err(|e| e.to_string())?);
@@ -1407,8 +1467,8 @@ pub async fn get_map_points(
         if !seen.insert(key) {
             continue;
         }
-        if points.len() >= limit {
-            truncated = true;
+        if points.len() >= collect_cap {
+            hit_collect_cap = true;
             break;
         }
         let plot_id = plot_s
@@ -1432,6 +1492,10 @@ pub async fn get_map_points(
             symbol,
         });
     }
+
+    let before = points.len();
+    let points = subsample_spatially(points, limit);
+    let truncated = hit_collect_cap || before > points.len();
 
     Ok(MapPointsResult {
         points,
