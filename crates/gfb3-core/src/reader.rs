@@ -4,7 +4,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ReadError {
-    #[error("unsupported file extension '{0}'; expected xlsx, xls, csv, or parquet")]
+    #[error("unsupported file extension '{0}'; expected xlsx, xls, csv, tsv, txt, or parquet")]
     UnsupportedExtension(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -29,7 +29,7 @@ pub fn read_file(path: &Path) -> Result<DataFrame, ReadError> {
 
     let df = match ext.as_str() {
         "xlsx" | "xls" | "ods" => read_xlsx(path)?,
-        "csv" | "tsv" => read_csv(path)?,
+        "csv" | "tsv" | "txt" => read_csv(path)?,
         "parquet" => read_parquet(path)?,
         other => return Err(ReadError::UnsupportedExtension(other.to_string())),
     };
@@ -154,18 +154,17 @@ pub fn read_xlsx(path: &Path) -> Result<DataFrame, ReadError> {
     DataFrame::new(cols).map_err(ReadError::Polars)
 }
 
-/// Read a CSV/TSV file into a DataFrame.
+/// Read a delimited text file (CSV / TSV / TXT) into a DataFrame.
 ///
 /// All columns are read as strings (`infer_schema_length = 0`), matching the
 /// XLSX path. Polars' default 100-row inference otherwise treats early numeric
 /// Status codes as `i64` and fails when later rows contain labels like `"snag"`.
 /// Semantic casting happens in the mapping / transform steps.
+///
+/// Separator: `.tsv` → tab; `.csv` → comma; `.txt` (and others) → sniffed from
+/// the first non-empty line (comma, tab, or semicolon — whichever is most common).
 pub fn read_csv(path: &Path) -> Result<DataFrame, ReadError> {
-    let sep = if path.extension().and_then(|e| e.to_str()) == Some("tsv") {
-        b'\t'
-    } else {
-        b','
-    };
+    let sep = detect_separator(path)?;
 
     CsvReadOptions::default()
         .with_infer_schema_length(Some(0))
@@ -175,6 +174,45 @@ pub fn read_csv(path: &Path) -> Result<DataFrame, ReadError> {
         .map_err(ReadError::Polars)?
         .finish()
         .map_err(ReadError::Polars)
+}
+
+fn detect_separator(path: &Path) -> Result<u8, ReadError> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "tsv" => return Ok(b'\t'),
+        "csv" => return Ok(b','),
+        _ => {}
+    }
+
+    use std::io::{BufRead, BufReader};
+    let file = std::fs::File::open(path).map_err(ReadError::Io)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).map_err(ReadError::Io)?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            let commas = trimmed.bytes().filter(|&b| b == b',').count();
+            let tabs = trimmed.bytes().filter(|&b| b == b'\t').count();
+            let semis = trimmed.bytes().filter(|&b| b == b';').count();
+            return Ok(if tabs >= commas && tabs >= semis && tabs > 0 {
+                b'\t'
+            } else if semis > commas && semis >= tabs {
+                b';'
+            } else {
+                b','
+            });
+        }
+    }
+    Ok(b',')
 }
 
 /// Read a Parquet file into a DataFrame.
@@ -251,5 +289,32 @@ mod tests {
         let status = df.column("Status").unwrap();
         assert_eq!(status.dtype(), &DataType::String);
         assert_eq!(status.str().unwrap().get(2), Some("snag"));
+    }
+
+    #[test]
+    fn txt_comma_separated_loads_via_read_file() {
+        let path = std::env::temp_dir().join("gfb3_txt_comma_test.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "PlotID,TreeID,YR\nP1,T1,2010\nP1,T2,2011").unwrap();
+        }
+        let df = read_file(&path).expect(".txt comma-separated should load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(df.height(), 2);
+        assert_eq!(df.width(), 3);
+        assert!(df.column("PlotID").is_ok());
+    }
+
+    #[test]
+    fn txt_tab_separated_loads_via_read_file() {
+        let path = std::env::temp_dir().join("gfb3_txt_tab_test.txt");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "PlotID\tTreeID\tYR\nP1\tT1\t2010").unwrap();
+        }
+        let df = read_file(&path).expect(".txt tab-separated should load");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(df.height(), 1);
+        assert_eq!(df.width(), 3);
     }
 }

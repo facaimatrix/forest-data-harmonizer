@@ -1500,3 +1500,49 @@ pub async fn get_map_points(
 pub async fn save_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents.as_bytes()).map_err(|e| e.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Format conversion utility
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ConvertRequest {
+    pub input_path: String,
+    pub output_dir: String,
+    /// Optional base filename (without extension). Defaults to the input stem.
+    #[serde(default)]
+    pub base_name: Option<String>,
+    /// Target formats: "csv" | "tsv" | "parquet" | "xlsx"
+    pub formats: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn convert_file_formats(request: ConvertRequest) -> Result<gfb3_core::ConvertResult, String> {
+    use gfb3_core::{convert_to_formats, TableFormat};
+
+    let input = std::path::Path::new(&request.input_path);
+    if !input.is_file() {
+        return Err(format!("input file not found: {}", request.input_path));
+    }
+    let out_dir = std::path::Path::new(&request.output_dir);
+    let base = request
+        .base_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            input
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("converted")
+                .to_string()
+        });
+
+    let mut formats = Vec::new();
+    for f in &request.formats {
+        formats.push(TableFormat::parse(f).map_err(|e| e.to_string())?);
+    }
+
+    convert_to_formats(input, out_dir, &base, &formats).map_err(|e| e.to_string())
+}

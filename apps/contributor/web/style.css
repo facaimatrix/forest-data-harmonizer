@@ -764,10 +764,86 @@ td.null-cell { color: var(--text-muted); font-style: italic; }
 
 /* ── Free-access plot map workspace ─────────────────────── */
 body.map-workspace #step-indicator,
-body.map-workspace #nav { display: none; }
-body.map-workspace #main {
+body.map-workspace #nav,
+body.convert-workspace #step-indicator,
+body.convert-workspace #nav { display: none; }
+body.map-workspace #main,
+body.convert-workspace #main {
   max-width: none;
   padding: 1rem 1.25rem 1.5rem;
+}
+
+/* ── Format conversion workspace ────────────────────────── */
+.convert-view {
+  display: flex;
+  flex-direction: column;
+  gap: .85rem;
+  max-width: 44rem;
+}
+.convert-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.15rem;
+}
+.convert-field {
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+}
+.convert-field > label {
+  font-size: .72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.convert-row {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+}
+.convert-row input[type="text"],
+.convert-field > input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  padding: .45rem .6rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font-size: .9rem;
+}
+.convert-formats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .65rem 1.25rem;
+}
+.convert-chk {
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  font-size: .9rem;
+  cursor: pointer;
+}
+.convert-actions { margin-top: .15rem; }
+.convert-meta {
+  margin: 0;
+  font-size: .85rem;
+  color: var(--text-muted);
+}
+.convert-outputs {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: .82rem;
+  line-height: 1.55;
+}
+.convert-outputs code {
+  font-size: .8rem;
+  word-break: break-all;
 }
 .plot-map-view {
   display: flex;

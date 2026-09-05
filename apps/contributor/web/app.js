@@ -66,7 +66,7 @@ const COUNTRIES = [
   {n:'Botswana',iso:'BWA'},{n:'Brazil',iso:'BRA'},{n:'Brunei',iso:'BRN'},
   {n:'Bulgaria',iso:'BGR'},{n:'Burkina Faso',iso:'BFA'},{n:'Burundi',iso:'BDI'},
   {n:'Cabo Verde',iso:'CPV'},{n:'Cambodia',iso:'KHM'},{n:'Cameroon',iso:'CMR'},
-  {n:'Central African Republic',iso:'CAF'},{n:'Chad',iso:'TCD'},{n:'Chile',iso:'CHL'},
+  {n:'Canada',iso:'CAN'},{n:'Central African Republic',iso:'CAF'},{n:'Chad',iso:'TCD'},{n:'Chile',iso:'CHL'},
   {n:'China',iso:'CHN'},{n:'Colombia',iso:'COL'},{n:'Comoros',iso:'COM'},
   {n:'Congo (Brazzaville)',iso:'COG'},{n:'Congo (Kinshasa / DRC)',iso:'COD'},
   {n:'Costa Rica',iso:'CRI'},{n:"Côte d'Ivoire",iso:'CIV'},{n:'Croatia',iso:'HRV'},
@@ -228,8 +228,8 @@ const state = {
   validationReport: null,
   diagnosticReport: null,
 
-  // Free-access Map workspace (not tied to wizard nav)
-  workspaceView: 'workflow', // 'workflow' | 'map'
+  // Free-access workspaces (not tied to wizard nav)
+  workspaceView: 'workflow', // 'workflow' | 'map' | 'convert'
   mapView: {
     latCol: '',
     lonCol: '',
@@ -242,6 +242,13 @@ const state = {
     status: '',
     autoTried: false,
     autoPlotted: false,
+  },
+  convertView: {
+    inputPath: '',
+    outDir: '',
+    baseName: '',
+    formats: { csv: true, tsv: false, parquet: true, xlsx: false },
+    result: null,
   },
 };
 
@@ -1592,23 +1599,28 @@ function statusColSelected() {
 
 // ── Main render ────────────────────────────────────────────────────────────────
 function render() {
+  const utilView = state.workspaceView === 'map' || state.workspaceView === 'convert';
   try {
     document.body.classList.toggle('map-workspace', state.workspaceView === 'map');
+    document.body.classList.toggle('convert-workspace', state.workspaceView === 'convert');
     document.querySelectorAll('.workspace-tab').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.view === state.workspaceView);
       if (btn.dataset.view === 'workflow') btn.textContent = t('workspace.workflow');
       if (btn.dataset.view === 'map') btn.textContent = t('workspace.map');
+      if (btn.dataset.view === 'convert') btn.textContent = t('workspace.convert');
     });
   } catch (e) {}
   try {
     document.getElementById('step-indicator').innerHTML =
-      state.workspaceView === 'map' ? '' : renderStepIndicator();
+      utilView ? '' : renderStepIndicator();
   } catch (e) {}
   try {
     let html = '';
     if (state.workspaceView === 'map') {
       maybeAutoSeedMapCols();
       html = renderMapView();
+    } else if (state.workspaceView === 'convert') {
+      html = renderConvertView();
     } else if (state.mode === 'diagnose') {
       html = (diagnoseRender() || renderStep1)();
     } else {
@@ -1621,7 +1633,7 @@ function render() {
   }
   try {
     document.getElementById('nav').innerHTML =
-      state.workspaceView === 'map' ? '' : renderNav();
+      utilView ? '' : renderNav();
   } catch(e){}
   try { attachHandlers(); } catch(e) { console.error('Handler error:', e); }
   I18n.applyStaticLabels();
@@ -1648,7 +1660,7 @@ function attachHandlers() {
   // Step 0
   el('pick-file', e => e.addEventListener('click', async () => {
     clearError();
-    const path = await openDialog({ multiple: false, filters: [{ name: t('common.dataFiles'), extensions: ['xlsx','xls','csv','tsv','parquet'] }] });
+    const path = await openDialog({ multiple: false, filters: [{ name: t('common.dataFiles'), extensions: ['xlsx','xls','csv','tsv','txt','parquet'] }] });
     if (!path) return;
     showLoading(t('loading.reading'));
     try {
@@ -1785,7 +1797,7 @@ function attachHandlers() {
     render();
   }));
   el('pick-lookup-file', btn => btn.addEventListener('click', async () => {
-    const path = await openDialog({ multiple: false, filters: [{ name: t('common.dataFiles'), extensions: ['xlsx','xls','csv','tsv','parquet'] }] });
+    const path = await openDialog({ multiple: false, filters: [{ name: t('common.dataFiles'), extensions: ['xlsx','xls','csv','tsv','txt','parquet'] }] });
     if (!path) return;
     showLoading(t('loading.lookup'));
     try {
@@ -1851,6 +1863,62 @@ function attachHandlers() {
   bind('map-utm-zone', v => { state.mapView.utmZone = v; });
   el('map-plot-btn', btn => btn.addEventListener('click', () => loadAndPlotMapPoints()));
   el('map-save-html', btn => btn.addEventListener('click', () => savePlotMapHtml()));
+
+  // Format conversion workspace
+  el('convert-pick-input', btn => btn.addEventListener('click', async () => {
+    clearError();
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: t('common.dataFiles'), extensions: ['xlsx', 'xls', 'csv', 'tsv', 'txt', 'parquet'] }],
+    });
+    if (!path) return;
+    const cv = state.convertView;
+    cv.inputPath = path;
+    cv.baseName = stemOf(path);
+    if (!cv.outDir) cv.outDir = dirnameOf(path);
+    cv.result = null;
+    render();
+  }));
+  el('convert-pick-outdir', btn => btn.addEventListener('click', async () => {
+    clearError();
+    const dir = await openDialog({ directory: true });
+    if (!dir) return;
+    state.convertView.outDir = dir;
+    render();
+  }));
+  el('convert-basename', inp => inp.addEventListener('input', e => {
+    state.convertView.baseName = e.target.value;
+  }));
+  ['csv', 'tsv', 'parquet', 'xlsx'].forEach(fmt => {
+    el(`convert-fmt-${fmt}`, chk => chk.addEventListener('change', e => {
+      state.convertView.formats[fmt] = e.target.checked;
+    }));
+  });
+  el('convert-run', btn => btn.addEventListener('click', async () => {
+    clearError();
+    const cv = state.convertView;
+    if (!cv.inputPath) { showError(t('convert.needInput')); return; }
+    if (!cv.outDir) { showError(t('convert.needOutDir')); return; }
+    const formats = Object.entries(cv.formats).filter(([, on]) => on).map(([k]) => k);
+    if (!formats.length) { showError(t('convert.needFormat')); return; }
+    showLoading(t('convert.loading'));
+    try {
+      const result = await invoke('convert_file_formats', {
+        request: {
+          input_path: cv.inputPath,
+          output_dir: cv.outDir,
+          base_name: (cv.baseName || '').trim() || null,
+          formats,
+        },
+      });
+      cv.result = result;
+      render();
+    } catch (e) {
+      showError(String(e));
+    } finally {
+      hideLoading();
+    }
+  }));
 
   // Step 4 — multi-col add/remove (PlotID, TreeID)
   qsa('.fa-add-sel', sel => sel.addEventListener('change', e => {
@@ -2483,6 +2551,76 @@ function projectToWgs84(yOrLat, xOrLon, crsCode) {
   // proj4 expects [x, y] = [easting/lon, northing/lat]
   const [lon, lat] = proj4(crsCode, 'EPSG:4326', [xOrLon, yOrLat]);
   return { lat, lon };
+}
+
+function basenameOf(path) {
+  if (!path) return '';
+  const trimmed = String(path).replace(/[/\\]+$/, '');
+  const i = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
+  return i < 0 ? trimmed : trimmed.slice(i + 1);
+}
+
+function stemOf(path) {
+  const base = basenameOf(path);
+  const dot = base.lastIndexOf('.');
+  return dot > 0 ? base.slice(0, dot) : base;
+}
+
+function renderConvertView() {
+  const cv = state.convertView;
+  const fmts = cv.formats;
+  const result = cv.result;
+  const meta = result
+    ? `<p class="convert-meta">${esc(t('convert.meta', {
+        rows: Number(result.row_count || 0).toLocaleString(),
+        cols: Number(result.column_count || 0).toLocaleString(),
+      }))}</p>`
+    : '';
+  const outputs = result && Array.isArray(result.outputs) && result.outputs.length
+    ? `<ul class="convert-outputs">${result.outputs.map(p =>
+        `<li><code>${esc(p)}</code></li>`
+      ).join('')}</ul>`
+    : '';
+  return `<div class="convert-view">
+    <div>
+      <h2>${esc(t('convert.title'))}</h2>
+      <p class="step-desc">${esc(t('convert.desc'))}</p>
+    </div>
+    <div class="convert-panel">
+      <div class="convert-field">
+        <label>${esc(t('convert.inputLabel'))}</label>
+        <div class="convert-row">
+          <input type="text" id="convert-input" readonly value="${esc(cv.inputPath)}" placeholder="${esc(t('convert.pickInput'))}" />
+          <button type="button" class="btn btn-ghost" id="convert-pick-input">${esc(t('convert.pickInput'))}</button>
+        </div>
+      </div>
+      <div class="convert-field">
+        <label>${esc(t('convert.formats'))}</label>
+        <div class="convert-formats">
+          <label class="convert-chk"><input type="checkbox" id="convert-fmt-csv" ${fmts.csv ? 'checked' : ''} /> ${esc(t('convert.fmtCsv'))}</label>
+          <label class="convert-chk"><input type="checkbox" id="convert-fmt-tsv" ${fmts.tsv ? 'checked' : ''} /> ${esc(t('convert.fmtTsv'))}</label>
+          <label class="convert-chk"><input type="checkbox" id="convert-fmt-parquet" ${fmts.parquet ? 'checked' : ''} /> ${esc(t('convert.fmtParquet'))}</label>
+          <label class="convert-chk"><input type="checkbox" id="convert-fmt-xlsx" ${fmts.xlsx ? 'checked' : ''} /> ${esc(t('convert.fmtXlsx'))}</label>
+        </div>
+      </div>
+      <div class="convert-field">
+        <label>${esc(t('convert.outDir'))}</label>
+        <div class="convert-row">
+          <input type="text" id="convert-outdir" readonly value="${esc(cv.outDir)}" placeholder="${esc(t('convert.phOutDir'))}" />
+          <button type="button" class="btn btn-ghost" id="convert-pick-outdir">${esc(t('common.browse'))}</button>
+        </div>
+      </div>
+      <div class="convert-field">
+        <label for="convert-basename">${esc(t('convert.baseName'))}</label>
+        <input type="text" id="convert-basename" value="${esc(cv.baseName)}" />
+      </div>
+      <div class="convert-actions">
+        <button type="button" class="btn btn-primary" id="convert-run">${esc(t('convert.run'))}</button>
+      </div>
+      ${meta}
+      ${outputs}
+    </div>
+  </div>`;
 }
 
 function mapColOptions(selected) {

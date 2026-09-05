@@ -1,3 +1,4 @@
+pub mod convert;
 pub mod diagnostic;
 pub mod export;
 pub mod gfb2;
@@ -11,6 +12,7 @@ pub mod tnrs;
 pub mod transform;
 pub mod validation;
 
+pub use convert::{convert_file, convert_to_formats, ConvertError, ConvertResult, TableFormat};
 pub use diagnostic::{build_diagnostic_report, write_diagnostic_html, write_diagnostic_pdf, DiagnosticReport};
 pub use schema::{
     field_def_by_name, gfb2_export_columns, gfb3_export_columns, gfb3_field_defs, select_export_columns,

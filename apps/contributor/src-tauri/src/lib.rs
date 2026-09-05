@@ -3,8 +3,9 @@ mod state;
 
 use commands::{
     apply_fields_mapping, apply_mapping, apply_species_resolutions, apply_wide_mapping,
-    derive_status, export, export_diagnostic_report, get_map_points, get_status_vocab, load_file,
-    preview_file, resolve_species_tnrs, run_validation, save_text_file, use_raw_as_gfb3,
+    convert_file_formats, derive_status, export, export_diagnostic_report, get_map_points,
+    get_status_vocab, load_file, preview_file, resolve_species_tnrs, run_validation, save_text_file,
+    use_raw_as_gfb3,
 };
 use state::AppState;
 
@@ -29,6 +30,7 @@ pub fn run() {
             export,
             get_map_points,
             save_text_file,
+            convert_file_formats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
